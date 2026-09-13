@@ -1,0 +1,49 @@
+[package]
+name = "chimaera"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/creadone/chimaera"
+readme = "README.md"
+include = ["/src/**", "/tests/**", "/examples/**", "/Cargo.lock", "/README.md", "/README.ru.md", "/CONTRIBUTING.md", "/LICENSE", "/docs/DESIGN.md", "/docs/DESIGN.ru.md", "/assets/**"]
+description = "Embedded time-series storage engine for ordered aggregates"
+
+[[bin]]
+name = "chimaera-admin"
+path = "src/bin/chimaera_admin.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono-tz = "0.10.4"
+clap = { version = "4.5", features = ["derive"] }
+crc32c = "0.6"
+crossbeam-channel = "0.5"
+flate2 = "1.1"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.18", features = ["v4"] }
+zstd = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+proptest = "1.7"
+tempfile = "3.21"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = "warn"
+
+[lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+perf = "warn"

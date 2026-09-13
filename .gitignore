@@ -1,0 +1,6 @@
+/target/
+.DS_Store
+/SESSION_ID
+/.agents/
+/.codex/
+/skills-lock.json
