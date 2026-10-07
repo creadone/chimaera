@@ -1,4 +1,4 @@
-//! Слияние отсортированных курсоров и выбор видимой MVCC-версии.
+//! Sorted-cursor merging and snapshot commit filtering.
 
 use super::cursor::OperationCursor;
 use crate::error::{Result, corrupt};
@@ -66,19 +66,41 @@ impl MergedCursor {
 
 pub(crate) struct VisibleCursor {
     pub(super) merged: MergedCursor,
-    pub(super) pending: Option<VersionedPoint>,
+    previous: Option<crate::types::PointKey>,
+    deletions: Option<std::sync::Arc<crate::deletion::Deletions>>,
+    deletion_series: Option<crate::types::SeriesKey>,
+    deletion_cutoff: u64,
     pub(super) read_commit: u64,
     pub(super) operations_read: u64,
 }
 
 impl VisibleCursor {
+    pub(crate) fn release_sources(&mut self) {
+        self.merged.sources = Vec::new();
+        self.merged.heap = BinaryHeap::new();
+        self.deletions = None;
+    }
+
     pub fn new(sources: Vec<Box<dyn OperationCursor>>, read_commit: u64) -> Result<Self> {
         Ok(Self {
             merged: MergedCursor::new(sources)?,
-            pending: None,
+            previous: None,
+            deletions: None,
+            deletion_series: None,
+            deletion_cutoff: 0,
             read_commit,
             operations_read: 0,
         })
+    }
+
+    pub(crate) fn with_deletions(
+        mut self,
+        deletions: std::sync::Arc<crate::deletion::Deletions>,
+    ) -> Self {
+        if !deletions.entries.is_empty() {
+            self.deletions = Some(deletions);
+        }
+        self
     }
 
     #[must_use]
@@ -86,47 +108,31 @@ impl VisibleCursor {
         self.operations_read
     }
 
-    pub fn next_latest(&mut self) -> Result<Option<VersionedPoint>> {
-        let first = match self.pending.take() {
-            Some(point) => point,
-            None => match self.next_raw()? {
-                Some(point) => point,
-                None => return Ok(None),
-            },
-        };
-        let key = first.key;
-        let mut winner = (first.commit_id <= self.read_commit).then_some(first);
-        loop {
-            let Some(point) = self.next_raw()? else {
-                return Ok(winner);
-            };
-            if point.key != key {
-                self.pending = Some(point);
-                return Ok(winner);
-            }
-            if point.commit_id <= self.read_commit {
-                if let Some(current) = winner
-                    && (point.commit_id, point.ordinal) == (current.commit_id, current.ordinal)
-                    && point != current
-                {
-                    return Err(corrupt("conflicting operations share one point version"));
-                }
-                if winner.is_none_or(|current| {
-                    (point.commit_id, point.ordinal) > (current.commit_id, current.ordinal)
-                }) {
-                    winner = Some(point);
-                }
-            }
-        }
-    }
-
     pub fn next_visible(&mut self) -> Result<Option<VersionedPoint>> {
-        loop {
-            match self.next_latest()? {
-                Some(operation) if operation.is_delete => {}
-                operation => return Ok(operation),
+        while let Some(point) = self.next_raw()? {
+            if let Some(deletions) = &self.deletions {
+                if self.deletion_series != Some(point.key.series) {
+                    self.deletion_series = Some(point.key.series);
+                    self.deletion_cutoff = deletions.cutoff(point.key.series);
+                }
+                // Erased incarnations may reuse timestamps. Discard them before
+                // validating the strict ordering of the surviving incarnation.
+                if point.commit_id <= self.deletion_cutoff {
+                    continue;
+                }
+            }
+
+            if self.previous.is_some_and(|key| point.key <= key) {
+                return Err(corrupt(
+                    "immutable sources contain a duplicate or decreasing point",
+                ));
+            }
+            self.previous = Some(point.key);
+            if point.commit_id <= self.read_commit {
+                return Ok(Some(point));
             }
         }
+        Ok(None)
     }
 
     pub(super) fn next_raw(&mut self) -> Result<Option<VersionedPoint>> {
@@ -135,5 +141,41 @@ impl VisibleCursor {
             self.operations_read = self.operations_read.saturating_add(1);
         }
         Ok(point)
+    }
+}
+
+pub(crate) fn filter_deletions(
+    source: Box<dyn OperationCursor>,
+    deletions: std::sync::Arc<crate::deletion::Deletions>,
+) -> Box<dyn OperationCursor> {
+    if deletions.entries.is_empty() {
+        return source;
+    }
+    Box::new(DeletedCursor {
+        source,
+        deletions,
+        series: None,
+        cutoff: 0,
+    })
+}
+
+struct DeletedCursor {
+    source: Box<dyn OperationCursor>,
+    deletions: std::sync::Arc<crate::deletion::Deletions>,
+    series: Option<crate::types::SeriesKey>,
+    cutoff: u64,
+}
+impl OperationCursor for DeletedCursor {
+    fn next_operation(&mut self) -> Result<Option<VersionedPoint>> {
+        while let Some(point) = self.source.next_operation()? {
+            if self.series != Some(point.key.series) {
+                self.series = Some(point.key.series);
+                self.cutoff = self.deletions.cutoff(point.key.series);
+            }
+            if point.commit_id > self.cutoff {
+                return Ok(Some(point));
+            }
+        }
+        Ok(None)
     }
 }

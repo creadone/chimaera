@@ -1,35 +1,54 @@
 [package]
 name = "chimaera"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.96"
-license = "MIT"
+autobins = false
+autotests = false
+autobenches = false
 repository = "https://github.com/creadone/chimaera"
 readme = "README.md"
-include = ["/src/**", "/tests/**", "/examples/**", "/Cargo.lock", "/README.md", "/README.ru.md", "/CONTRIBUTING.md", "/LICENSE", "/docs/DESIGN.md", "/docs/DESIGN.ru.md", "/assets/**"]
+rust-version = "1.96"
+license = "MIT"
 description = "Embedded time-series storage engine for ordered aggregates"
+include = ["/Cargo.toml", "/Cargo.lock", "/LICENSE", "/README.md", "/README.ru.md", "/src/**/*.rs", "/examples/*.rs", "/docs/*.md", "/assets/chimaera-logo.png"]
+
+[workspace]
+resolver = "3"
+
+[features]
+# Observation support only; executables choose and configure their own allocator.
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+pipeline-trace = ["dep:tracing"]
+read-diagnostics = []
+publication-diagnostics = []
+state-diagnostics = ["read-diagnostics"]
+cli = ["dep:clap"]
 
 [[bin]]
 name = "chimaera-admin"
-path = "src/bin/chimaera_admin.rs"
+path = "src/bin/admin/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 chrono-tz = "0.10.4"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"], optional = true }
 crc32c = "0.6"
 crossbeam-channel = "0.5"
 flate2 = "1.1"
 libc = "0.2"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "2.0"
+tikv-jemallocator = { version = "=0.7.0", optional = true, features = ["stats", "profiling"] }
+tikv-jemalloc-ctl = { version = "=0.7.0", optional = true, features = ["stats"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 uuid = { version = "1.18", features = ["v4"] }
 zstd = { version = "0.14", default-features = false }
 
 [dev-dependencies]
-proptest = "1.7"
 tempfile = "3.21"
 
 [profile.release]

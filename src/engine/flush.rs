@@ -1,17 +1,20 @@
-//! Координатор сброса поколений памяти и работники упаковки.
+//! Memory-generation flush coordinator and pack workers.
+
+#[cfg(feature = "pipeline-trace")]
+use crate::diagnostics::trace::Stage;
 
 use super::catalog::{compression_profile_for_domain, storage_domain};
-use super::compaction_selection::sealed_before_for_policy;
 use super::publication::UnpublishedArtifacts;
-use super::support::{duration_nanos, lock, read};
+use super::support::{duration_nanos, lock};
 use super::{
     ACTIVE_COMPACTION_MAX_INPUT_BYTES, APPROXIMATE_POINT_BYTES, FlushCommand, FlushPackCommand,
     FlushPackOutput, FlushSlice, Generation, Inner, PublishCommand, degrade,
 };
-use crate::admission::WorkMemoryClass;
 use crate::catalog::CatalogSnapshot;
+use crate::engine::compaction::selection::sealed_before_for_policy;
 use crate::error::{Error, Result, corrupt};
-use crate::layout::Domain;
+use crate::memory::work::WorkMemoryClass;
+use crate::persistence::layout::Domain;
 use crate::segment::{
     OperationCursor, RangedSliceCursor, SegmentPackResources, SegmentWriteRequest,
     prepare_segment_pack, sync_segment_pack_group,
@@ -78,16 +81,19 @@ pub(super) fn flush_loop(inner: Arc<Inner>, receiver: Receiver<FlushCommand>) {
 }
 
 fn flush_generation(inner: &Inner, generation: Arc<Generation>) -> Result<u64> {
+    #[cfg(feature = "pipeline-trace")]
+    inner.trace_generation(generation.id, Stage::FlushStarted);
     let work_memory = inner
         .work_memory_governor
         .reserve_background(WorkMemoryClass::Flush, generation.bytes)?;
     let mut domains = BTreeMap::<(Domain, bool), Vec<FlushSlice>>::new();
-    let (catalog, maintenance_now_us, event_watermarks) = {
-        let state = read(&inner.state)?;
+    let (catalog, maintenance_now_us, event_watermarks, deletions) = {
+        let state = inner.state.read()?;
         (
             state.catalog.clone(),
             state.maintenance_now_us,
             state.event_watermarks.clone(),
+            Arc::clone(&state.deletions),
         )
     };
     for batch in &generation.batches {
@@ -167,10 +173,17 @@ fn flush_generation(inner: &Inner, generation: Arc<Generation>) -> Result<u64> {
                 );
                 source_bytes = 0;
             }
-            sources.push(Box::new(RangedSliceCursor::new(
+            let source: Box<dyn OperationCursor> = Box::new(RangedSliceCursor::new(
                 slice.batch,
                 vec![(slice.start, slice.end)],
-            )?));
+            )?);
+            if deletions.entries.is_empty() {
+                sources.push(source);
+            } else if let Some(source) = super::support::non_empty_cursor(
+                crate::segment::filter_deletions(source, Arc::clone(&deletions)),
+            )? {
+                sources.push(source);
+            }
             source_bytes = source_bytes.saturating_add(slice_bytes);
         }
         if !sources.is_empty() {
@@ -183,6 +196,22 @@ fn flush_generation(inner: &Inner, generation: Arc<Generation>) -> Result<u64> {
                 sources,
                 &mut requests,
             );
+        }
+    }
+    #[cfg(feature = "pipeline-trace")]
+    for requests in requests.values_mut() {
+        for request in requests {
+            request.trace = inner.trace_region(
+                request.domain,
+                i64::MIN,
+                i64::MAX,
+                Some(generation.id),
+                &[],
+                0,
+            );
+            request
+                .trace
+                .mark(Stage::FlushPackQueued, Stage::CompactionPackQueued);
         }
     }
     let mut segments = Vec::new();
@@ -233,10 +262,14 @@ fn flush_generation(inner: &Inner, generation: Arc<Generation>) -> Result<u64> {
     if request_count != 0 {
         sync_segment_pack_group(&inner.root)?;
     }
+    #[cfg(feature = "pipeline-trace")]
+    inner.trace_generation(generation.id, Stage::FlushPublishQueued);
     let (reply_tx, reply_rx) = bounded(1);
     inner
         .publish_tx
         .send(PublishCommand::Flush {
+            #[cfg(feature = "publication-diagnostics")]
+            queued: crate::diagnostics::publication::queued(inner.publication_diagnostics.get()),
             generation,
             segments,
             unpublished,
@@ -261,6 +294,8 @@ fn push_flush_request(
         .entry((domain.shard_id, domain.policy_id, historical))
         .or_default()
         .push(SegmentWriteRequest {
+            #[cfg(feature = "pipeline-trace")]
+            trace: crate::diagnostics::trace::RegionTrace::default(),
             segment_id,
             level: 0,
             domain,
@@ -279,6 +314,12 @@ pub(super) fn flush_pack_loop(inner: Arc<Inner>, receiver: Receiver<FlushPackCom
                 requests,
                 reply,
             } => {
+                #[cfg(feature = "pipeline-trace")]
+                for request in &requests {
+                    request
+                        .trace
+                        .mark(Stage::FlushPackStarted, Stage::CompactionPackStarted);
+                }
                 let result = prepare_segment_pack(
                     &inner.root,
                     inner.storage_uuid,
@@ -296,6 +337,15 @@ pub(super) fn flush_pack_loop(inner: Arc<Inner>, receiver: Receiver<FlushPackCom
                 .map(|(segments, pack_guard)| {
                     let mut unpublished = UnpublishedArtifacts::default();
                     for result in &segments {
+                        #[cfg(feature = "pipeline-trace")]
+                        inner.trace_outputs(
+                            std::slice::from_ref(&result.segment),
+                            Some(if result.segment.descriptor().level == 0 {
+                                Stage::FlushPackFinished
+                            } else {
+                                Stage::CompactionPackFinished
+                            }),
+                        );
                         unpublished.push(result.segment.path().to_path_buf());
                     }
                     pack_guard.commit();

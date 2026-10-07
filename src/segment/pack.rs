@@ -1,4 +1,4 @@
-//! Запись сегментов и pack-файлов, сборка блоков и публикация результата.
+//! Segment and pack writing, block construction, and output publication.
 
 use super::codecs::{encode_gorilla_values, encode_raw_values, encode_timestamps};
 use super::cursor::OperationCursor;
@@ -6,21 +6,23 @@ use super::index::{
     decode_paged_index_root, encode_index, paged_index_root_bytes, series_count, usize_u32,
 };
 use super::merge::VisibleCursor;
-use super::metadata_cache::MetadataCache;
 use super::{
     BLOCK_HEADER_SIZE, BLOCK_MAGIC, BlockIndex, CountSumSummary, EncodedRegion, FOOTER_MAGIC,
     FOOTER_SIZE, HEADER_SIZE, MAX_STORED_BLOCK_OVERHEAD, SEGMENT_MAGIC, Segment, SegmentDescriptor,
-    TARGET_BLOCK_POINTS,
+    TARGET_BLOCK_POINTS, TARGET_L2_BLOCK_POINTS,
 };
-use crate::admission::WorkMemoryGovernor;
 use crate::aggregate;
-use crate::cache::BlockCache;
 use crate::catalog::{BlockCodec, CompressionProfile, ValueCodec};
 use crate::error::{Result, invalid};
-use crate::file_pool::{FilePermitPool, OpenFileCache};
-use crate::layout::Domain;
+use crate::memory::cache::BlockCache;
+use crate::memory::work::WorkMemoryGovernor;
+use crate::persistence::files::{FilePermitPool, OpenFileCache};
+use crate::persistence::layout::Domain;
+use crate::persistence::wal::{
+    UnpublishedFileGuard, put_i64, put_u16, put_u32, put_u64, sync_directory,
+};
+use crate::segment::metadata::cache::MetadataCache;
 use crate::types::{AggregateSet, AggregateState, VersionedPoint};
-use crate::wal::{UnpublishedFileGuard, put_i64, put_u16, put_u32, put_u64, sync_directory};
 use flate2::{Compression, GzBuilder};
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -34,6 +36,8 @@ pub(crate) struct SegmentWriteResult {
 }
 
 pub(crate) struct SegmentWriteRequest {
+    #[cfg(feature = "pipeline-trace")]
+    pub trace: crate::diagnostics::trace::RegionTrace,
     pub segment_id: u64,
     pub level: u8,
     pub domain: Domain,
@@ -48,106 +52,6 @@ pub(crate) struct SegmentPackResources<'a> {
     pub file_pool: &'a FilePermitPool,
     pub open_file_cache: Option<&'a Arc<OpenFileCache>>,
     pub work_memory: Option<&'a Arc<WorkMemoryGovernor>>,
-}
-
-#[cfg(test)]
-pub(crate) fn write_segment(
-    root: &Path,
-    storage_uuid: [u8; 16],
-    segment_id: u64,
-    level: u8,
-    domain: Domain,
-    sources: Vec<Box<dyn OperationCursor>>,
-    block_cache: &Arc<BlockCache>,
-) -> Result<SegmentWriteResult> {
-    if sources.is_empty() || segment_id == 0 || level > 2 {
-        return Err(invalid("invalid segment write request"));
-    }
-    let temporary_directory = root.join("tmp");
-    let segment_directory = root
-        .join("segments")
-        .join(format!("S{:04}", domain.shard_id));
-    fs::create_dir_all(&temporary_directory)?;
-    fs::create_dir_all(&segment_directory)?;
-    let temporary_path = temporary_directory.join(format!("SEG-{segment_id:020}.tmp"));
-    let relative_path = format!(
-        "segments/S{:04}/SEG-{segment_id:020}-L{level}.tss",
-        domain.shard_id
-    );
-    let final_path = root.join(&relative_path);
-    let mut unpublished = UnpublishedFileGuard::new(final_path.clone());
-    let mut temporary = UnpublishedFileGuard::new(temporary_path.clone());
-    let file_pool = FilePermitPool::new(8)?;
-    let result = (|| -> Result<EncodedRegion> {
-        let _file_permit = file_pool.acquire()?;
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&temporary_path)?;
-        temporary.mark_present();
-        let mut file = BufWriter::with_capacity(1024 * 1024, file);
-        let result = write_segment_region(
-            &mut file,
-            0,
-            storage_uuid,
-            SegmentWriteRequest {
-                segment_id,
-                level,
-                domain,
-                profile: if level == 0 {
-                    CompressionProfile::hot_fast()
-                } else {
-                    CompressionProfile::columnar()
-                },
-                rewrite_count: 0,
-                sources,
-            },
-            None,
-        )?;
-        file.flush()?;
-        file.get_ref().sync_all()?;
-        Ok(result)
-    })();
-    let mut encoded = result?;
-    fs::rename(&temporary_path, &final_path)?;
-    temporary.commit();
-    unpublished.mark_present();
-    sync_directory(&temporary_directory)?;
-    sync_directory(&segment_directory)?;
-    encoded.descriptor.relative_path = relative_path;
-    let bytes_written = encoded.descriptor.file_size;
-    let metadata_cache = Arc::new(MetadataCache::new(u64::MAX));
-    let segment = Segment::from_written(
-        root,
-        encoded,
-        Arc::clone(block_cache),
-        metadata_cache,
-        file_pool,
-        None,
-        storage_uuid,
-    )?;
-    unpublished.commit();
-    Ok(SegmentWriteResult {
-        segment,
-        bytes_written,
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn write_segment_pack(
-    root: &Path,
-    storage_uuid: [u8; 16],
-    pack_id: u64,
-    shard_id: u16,
-    requests: Vec<SegmentWriteRequest>,
-    resources: SegmentPackResources<'_>,
-) -> Result<Vec<SegmentWriteResult>> {
-    let (results, unpublished) =
-        prepare_segment_pack(root, storage_uuid, pack_id, shard_id, requests, resources)?;
-    sync_segment_pack_group(root)?;
-    unpublished.commit();
-    Ok(results)
 }
 
 /// Prepared files remain owned by the returned guard until the coordinator
@@ -193,6 +97,7 @@ pub(crate) fn prepare_segment_pack(
             .write(true)
             .open(&temporary_path)?;
         temporary.mark_present();
+
         let mut file = BufWriter::with_capacity(1024 * 1024, file);
         let mut regions = Vec::with_capacity(requests.len());
         for request in requests {
@@ -210,17 +115,17 @@ pub(crate) fn prepare_segment_pack(
             regions.push(encoded);
         }
         file.flush()?;
-        crate::failpoint::io_error("pack_file_sync")?;
+
         file.get_ref().sync_all()?;
-        crate::failpoint::hit("segment_after_sync");
+
         Ok(regions)
     })();
     let regions = result?;
-    crate::failpoint::io_error("pack_rename")?;
+
     fs::rename(&temporary_path, &final_path)?;
     temporary.commit();
     unpublished.mark_present();
-    crate::failpoint::hit("segment_after_rename");
+
     let mut results = Vec::with_capacity(regions.len());
     for encoded in regions {
         let bytes_written = encoded.descriptor.file_size;
@@ -243,17 +148,14 @@ pub(crate) fn prepare_segment_pack(
 /// Complete the namespace durability barrier after every rename in this group.
 /// Callers retain ownership of all prepared files until manifest commit.
 pub(crate) fn sync_segment_pack_group(root: &Path) -> Result<()> {
-    crate::failpoint::hit("pack_group_before_barrier");
-    crate::failpoint::io_error("pack_group_tmp_sync")?;
     sync_directory(&root.join("tmp"))?;
-    crate::failpoint::hit("pack_group_after_tmp_sync");
-    crate::failpoint::io_error("pack_group_packs_sync")?;
+
     sync_directory(&root.join("segments/packs"))?;
     // Also covers creation of packs/ by a concurrent group whose own attempt
     // failed. The parent barrier cannot depend on another group's success.
-    crate::failpoint::io_error("pack_group_parent_sync")?;
+
     sync_directory(&root.join("segments"))?;
-    crate::failpoint::hit("pack_group_after_barrier");
+
     Ok(())
 }
 
@@ -321,9 +223,13 @@ impl SegmentRegionBuilder {
         {
             return Err(invalid("segment operation is outside its partition window"));
         }
+        let block_points = if self.level == 2 {
+            TARGET_L2_BLOCK_POINTS
+        } else {
+            TARGET_BLOCK_POINTS
+        };
         if !self.block.is_empty()
-            && (self.block[0].key.series != point.key.series
-                || self.block.len() >= TARGET_BLOCK_POINTS)
+            && (self.block[0].key.series != point.key.series || self.block.len() >= block_points)
         {
             self.flush_block(file)?;
         }
@@ -501,16 +407,23 @@ pub(super) fn write_segment_region(
     work_memory: Option<&Arc<WorkMemoryGovernor>>,
 ) -> Result<EncodedRegion> {
     let mut builder = SegmentRegionBuilder::new(file, base_offset, &request, work_memory)?;
+    #[cfg(feature = "pipeline-trace")]
+    let mut trace = request.trace;
     let sources = request.sources;
     let mut merged = VisibleCursor::new(sources, u64::MAX)?;
-    while let Some(point) = merged.next_latest()? {
+    while let Some(point) = merged.next_visible()? {
+        #[cfg(feature = "pipeline-trace")]
+        trace.observe(point);
         builder.push(file, point)?;
     }
-    builder.finish(file, storage_uuid)
+    let encoded = builder.finish(file, storage_uuid)?;
+    #[cfg(feature = "pipeline-trace")]
+    trace.encoded(encoded.descriptor.id, encoded.aggregate.as_deref());
+    Ok(encoded)
 }
 
 pub(super) fn write_block(
-    file: &mut BufWriter<File>,
+    file: &mut impl Write,
     operations: &[VersionedPoint],
     profile: CompressionProfile,
     offset: u64,
@@ -531,7 +444,7 @@ pub(super) fn write_block(
         return Err(invalid("a segment block must contain one series"));
     }
     let mut count_sum = Some(AggregateState::for_aggregates(AggregateSet::COUNT_SUM));
-    for operation in operations.iter().filter(|operation| !operation.is_delete) {
+    for operation in operations.iter() {
         let value = operation.put_value()?;
         if let Some(summary) = count_sum.as_mut()
             && summary.add(operation.key.timestamp_us, value).is_err()
@@ -543,31 +456,23 @@ pub(super) fn write_block(
         }
     }
     let timestamps = encode_timestamps(operations, profile.timestamp_codec)?;
-    let mut versions = Vec::with_capacity(operations.len() * 12);
-    let kinds = operations
-        .iter()
-        .map(|operation| if operation.is_delete { 2 } else { 1 })
-        .collect::<Vec<_>>();
+    let mut versions = Vec::with_capacity(operations.len() * 8);
     for point in operations {
-        let start = versions.len();
-        versions.resize(start + 12, 0);
-        put_u64(&mut versions, start, point.commit_id);
-        put_u32(&mut versions, start + 8, point.ordinal);
+        versions.extend_from_slice(&point.commit_id.to_le_bytes());
     }
     let values = match profile.value_codec {
         ValueCodec::RawFloat64 => encode_raw_values(operations),
         ValueCodec::GorillaXor => encode_gorilla_values(operations),
     };
-    let payload_length = 16_usize
+    let payload_length = 12_usize
         .checked_add(timestamps.len())
         .and_then(|size| size.checked_add(versions.len()))
-        .and_then(|size| size.checked_add(kinds.len()))
         .and_then(|size| size.checked_add(values.len()))
         .ok_or_else(|| invalid("segment block length overflow"))?;
     if payload_length > 4 * 1024 * 1024 {
         return Err(invalid("segment block exceeds 4 MiB"));
     }
-    let mut payload = vec![0_u8; 16];
+    let mut payload = vec![0_u8; 12];
     put_u32(
         &mut payload,
         0,
@@ -578,11 +483,9 @@ pub(super) fn write_block(
         4,
         usize_u32(versions.len(), "version stream")?,
     );
-    put_u32(&mut payload, 8, usize_u32(kinds.len(), "operation stream")?);
-    put_u32(&mut payload, 12, usize_u32(values.len(), "value stream")?);
+    put_u32(&mut payload, 8, usize_u32(values.len(), "value stream")?);
     payload.extend_from_slice(&timestamps);
     payload.extend_from_slice(&versions);
-    payload.extend_from_slice(&kinds);
     payload.extend_from_slice(&values);
     let uncompressed_size = payload.len();
     let (stored, block_codec_id, block_level_marker) = match profile.block_codec {
@@ -614,7 +517,7 @@ pub(super) fn write_block(
     let mut header = [0_u8; BLOCK_HEADER_SIZE];
     header[..4].copy_from_slice(BLOCK_MAGIC);
     put_u16(&mut header, 4, BLOCK_HEADER_SIZE as u16);
-    header[6] = 1;
+    header[6] = crate::persistence::decode::BLOCK_FORMAT;
     put_u32(&mut header, 8, first.key.series.space_id);
     put_u32(&mut header, 12, first.key.series.bucket_id);
     put_u64(&mut header, 16, first.key.series.key);
@@ -630,16 +533,6 @@ pub(super) fn write_block(
         &mut header,
         56,
         usize_u32(operations.len(), "block points")?,
-    );
-    let put_count = operations
-        .iter()
-        .filter(|operation| !operation.is_delete)
-        .count();
-    put_u32(&mut header, 60, usize_u32(put_count, "block puts")?);
-    put_u32(
-        &mut header,
-        64,
-        usize_u32(operations.len() - put_count, "block deletes")?,
     );
     header[68] = profile.timestamp_codec_id();
     header[69] = profile.value_codec_id();

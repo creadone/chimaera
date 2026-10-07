@@ -1,48 +1,47 @@
-//! Открытие Storage, восстановление WAL и очистка неопубликованных файлов.
+//! Opening storage, WAL recovery, and unpublished-file cleanup.
 
 use super::compaction::compaction_loop;
-use super::compaction_selection::refresh_l1_debt;
 use super::executor::QueryExecutor;
 use super::flush::{flush_loop, flush_pack_loop};
-use super::index::{PublishedReadDirectoryIndex, PublishedSegmentIndex};
 use super::maintenance::maintenance_loop;
 use super::options::OpenOptions;
 use super::publication::publisher_loop;
 use super::regulator::WriteRegulator;
 use super::snapshots::SnapshotTracker;
-use super::support::{DrainState, duration_nanos, file_bytes, lock, wal_paths, write};
+use super::support::{DrainState, duration_nanos, file_bytes, lock, wal_paths};
 use super::writer::{StrictWriteState, WriterCommitState, writer_loop};
 use super::{
     APPROXIMATE_POINT_BYTES, APPROXIMATE_SERIES_WATERMARK_BYTES, ClientOwner, Inner, Metrics, OPEN,
     State, Storage, UNMANAGED_FILE_RESERVE, WorkerHandles,
 };
-use crate::admission::{WorkMemoryClass, WorkMemoryGovernor};
-use crate::aggregate_archive::AggregateArchive;
-use crate::cache::{BlockCache, BlockLoadLimits, MemoryClass, MemoryGovernor};
-use crate::catalog::{DataTemperature, WriteMode};
+use crate::catalog::DataTemperature;
+use crate::engine::lifecycle::admission::WriteAdmission;
 use crate::error::{Error, Result, corrupt, invalid};
-use crate::file_pool::{FilePermitPool, OpenFileCache};
-use crate::lifecycle::WriteAdmission;
-use crate::manifest::{Manifest, ManifestArtifactKind};
-use crate::segment::{MetadataCache, OfflinePackDirectory, PointBatch, Segment};
-use crate::storage_lock::StorageLock;
+use crate::memory::cache::{BlockCache, BlockLoadLimits, MemoryClass, MemoryGovernor};
+use crate::memory::work::{WorkMemoryClass, WorkMemoryGovernor};
+use crate::persistence::files::{FilePermitPool, OpenFileCache};
+use crate::persistence::lock::StorageLock;
+use crate::persistence::manifest::Manifest;
+use crate::persistence::wal::{
+    WalWriter, inspect_directory_with, repair_directory, sync_directory,
+};
+use crate::segment::{MetadataCache, OfflinePackDirectory, PointBatch};
 use crate::types::{SeriesKey, VersionedPoint};
-use crate::wal::{WalWriter, inspect_directory_with, repair_truncated_tail, sync_directory};
 use crossbeam_channel::bounded;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use std::{fs, thread};
 
 impl Storage {
-    /// Открывает или создаёт базу, проверяя identity, manifest, физические границы
-    /// сегментов и WAL. Полная проверка metadata и payload доступна через [`Self::verify`].
+    /// Open or create a database, validating identity, manifest, physical segment
+    /// bounds, and WAL. Use [`Self::verify`] for full metadata and payload validation.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку при повреждении метаданных, сегмента, WAL или при ошибке I/O.
+    /// Returns metadata, segment, or WAL corruption errors, invalid options, lock conflicts, or I/O errors.
     pub fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         options.validate()?;
         let started = Instant::now();
@@ -54,110 +53,62 @@ impl Storage {
             fs::create_dir_all(&root)?;
         }
         let storage_lock = StorageLock::acquire(&root)?;
+        let _catalog_lock = StorageLock::catalog_exclusive(&root)?;
         let manifest_started = Instant::now();
-        let manifest = Manifest::load_or_create(
+        let mut manifest = Manifest::load_or_create(
             &root,
             options.create_if_missing,
             options.virtual_shards,
             options.partition_span_us,
         )?;
+        if (manifest.file_totals.directory_segments > 0) || (manifest.file_totals.directories > 0) {
+            return Err(invalid(
+                "read directory backend differs from this build; prototype requires a fresh database",
+            ));
+        }
         let recovery_manifest_nanos = duration_nanos(manifest_started.elapsed());
         fs::create_dir_all(root.join("aggregates"))?;
         let catalog = manifest.catalog.snapshot();
         let retention_cutoffs = manifest.retention_cutoffs.clone();
         let aggregate_retention_cutoffs = manifest.aggregate_retention_cutoffs.clone();
         let mut event_watermarks = manifest.event_watermarks.clone();
-        let mut segment_descriptors = manifest.segments.clone();
-        let mut published_segment_ids = HashMap::<u64, HashSet<u64>>::new();
-        for directory in &manifest.published_read_directories {
-            let mut embedded = OfflinePackDirectory::published_segment_descriptors(
-                &root,
-                directory,
-                &manifest.published_read_payload_files,
-                manifest.storage_uuid,
-            )?
-            .ok_or_else(|| corrupt("read generation does not embed its descriptors"))?;
-            published_segment_ids.insert(
-                directory.generation_id,
-                embedded.iter().map(|descriptor| descriptor.id).collect(),
-            );
-            segment_descriptors.append(&mut embedded);
-        }
-        segment_descriptors.sort_unstable_by_key(|descriptor| descriptor.id);
-        if segment_descriptors
-            .windows(2)
-            .any(|pair| pair[0].id == pair[1].id)
-        {
-            return Err(corrupt(
-                "manifest and read directory contain duplicate segment IDs",
-            ));
-        }
-        let generation_ids = manifest
-            .published_read_directories
-            .iter()
-            .map(|directory| directory.generation_id)
-            .collect::<HashSet<_>>();
-        let embedded_segment_ids = published_segment_ids
-            .values()
-            .flatten()
-            .copied()
-            .collect::<HashSet<_>>();
-        let embedded_payload_paths = segment_descriptors
-            .iter()
-            .filter(|descriptor| embedded_segment_ids.contains(&descriptor.id))
-            .map(|descriptor| descriptor.relative_path.as_str())
-            .collect::<HashSet<_>>();
-        let published_payload_paths = manifest
-            .published_read_payload_files
-            .iter()
-            .map(|payload| payload.relative_path.as_str())
-            .collect::<HashSet<_>>();
-        if embedded_payload_paths != published_payload_paths {
-            return Err(corrupt(
-                "read generation payload inventory does not match its descriptors",
-            ));
-        }
-        if segment_descriptors.iter().any(|descriptor| {
-            descriptor.id == 0
-                || descriptor.id >= manifest.next_segment_id
-                || generation_ids.contains(&descriptor.id)
-                || descriptor.shard_id >= manifest.virtual_shards
-                || (embedded_segment_ids.contains(&descriptor.id)
-                    && catalog.policy_by_id(descriptor.policy_id).is_none())
-                || descriptor.window_start_us >= descriptor.window_end_us
-                || descriptor.min_timestamp_us > descriptor.max_timestamp_us
-                || descriptor.min_timestamp_us < descriptor.window_start_us
-                || descriptor.max_timestamp_us >= descriptor.window_end_us
-                || descriptor.max_commit > manifest.materialized_commit()
-        }) {
-            return Err(corrupt("read generation contains invalid segment metadata"));
-        }
-        for descriptor in &segment_descriptors {
-            event_watermarks
-                .entry(descriptor.policy_id)
-                .and_modify(|watermark| *watermark = (*watermark).max(descriptor.max_timestamp_us))
-                .or_insert(descriptor.max_timestamp_us);
-        }
         let maintenance_now_us = options.clock.now_us();
-        let memory_governor = Arc::new(MemoryGovernor::new(options.memory_max_bytes));
+        let memory_governor = Arc::new(MemoryGovernor::with_limits(
+            options.memory_max_bytes,
+            options.metadata_cache_max_bytes,
+            options.write_memory_reserve(),
+        ));
+        Arc::get_mut(&mut manifest.deletions)
+            .ok_or_else(|| corrupt("recovery deletion state is unexpectedly shared"))?
+            .charge(&memory_governor)?;
+        let mut deletions = Arc::clone(&manifest.deletions);
         let directory_page_pool = crate::segment::DirectoryPagePool::new();
+
         let work_memory_governor = WorkMemoryGovernor::new(options.memory_max_bytes);
-        let file_pool = FilePermitPool::new(
-            options
-                .file_descriptor_max
-                .saturating_sub(UNMANAGED_FILE_RESERVE),
-        )?;
-        let open_file_cache = OpenFileCache::new(
-            file_pool.clone(),
-            options.flush_worker_count.saturating_add(1),
-        );
+        let file_capacity = options
+            .file_descriptor_max
+            .saturating_sub(UNMANAGED_FILE_RESERVE);
+        let background_file_reserve = options
+            .flush_worker_count
+            .saturating_add(1 + if file_capacity >= 16 { 8 } else { 0 });
+        let query_file_capacity =
+            OpenFileCache::capacity_for(file_capacity, background_file_reserve);
+        // Keep both the existing query cache and transient reserve unchanged.
+        // Only the remaining permits may survive between compaction block reads;
+        // small FD configurations therefore retain none. The cursor owns them.
+        let retained_file_capacity = file_capacity
+            .saturating_sub(query_file_capacity)
+            .saturating_sub(background_file_reserve)
+            .min(32);
+        let file_pool = FilePermitPool::with_retained_limit(file_capacity, retained_file_capacity)?;
+        let open_file_cache = OpenFileCache::new(file_pool.clone(), background_file_reserve);
         let snapshot_tracker = Arc::new(SnapshotTracker::default());
         let write_regulator = WriteRegulator::new(
             options.read_latency_slowdown_threshold,
             options.wide_read_latency_slowdown_threshold,
             options.write_pacing_max_delay,
         );
-        let query_executor = QueryExecutor::new()?;
+        let query_executor = QueryExecutor::new(options.query_worker_count)?;
         let block_cache = Arc::new(BlockCache::with_governor_and_load_limits(
             options.block_cache_max_bytes,
             Arc::clone(&memory_governor),
@@ -171,60 +122,50 @@ impl Storage {
             options.metadata_cache_max_bytes,
             Arc::clone(&memory_governor),
         ));
+        memory_governor.register_cache(crate::memory::cache::CacheOwner::Index, &metadata_cache)?;
         let descriptors_started = Instant::now();
-        let mut segments = Vec::with_capacity(segment_descriptors.len());
-        for descriptor in segment_descriptors {
-            segments.push(Segment::open_with_file_cache_without_resident_index(
-                &root,
-                manifest.storage_uuid,
-                descriptor,
-                Arc::clone(&block_cache),
-                Arc::clone(&metadata_cache),
-                file_pool.clone(),
-                Arc::clone(&open_file_cache),
-            )?);
-        }
-        let published_read_directories = manifest
-            .published_read_directories
-            .iter()
-            .map(|descriptor| {
-                let ids = published_segment_ids
-                    .get(&descriptor.generation_id)
-                    .ok_or_else(|| corrupt("read generation segment set disappeared"))?;
-                let covered = segments
-                    .iter()
-                    .filter(|segment| ids.contains(&segment.descriptor().id))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                OfflinePackDirectory::open_published(
-                    &root,
-                    descriptor,
-                    manifest.storage_uuid,
-                    &covered,
-                    &memory_governor,
-                    &directory_page_pool,
-                    &file_pool,
-                    Arc::clone(&open_file_cache),
-                    options.metadata_cache_max_bytes,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let published_read_directory_index =
-            PublishedReadDirectoryIndex::build(&published_read_directories)?;
+        let file_catalog = crate::persistence::catalog::Catalog::open(
+            &root,
+            manifest.storage_uuid,
+            manifest.file_catalog,
+            file_pool.clone(),
+            Arc::clone(&memory_governor),
+            Arc::clone(&work_memory_governor),
+            options.metadata_cache_max_bytes / 4,
+        )?;
+        let resources = super::files::Resources::new(
+            root.clone(),
+            manifest.storage_uuid,
+            Arc::clone(&block_cache),
+            Arc::clone(&metadata_cache),
+            Arc::clone(&memory_governor),
+            file_pool.clone(),
+            Arc::clone(&open_file_cache),
+            options.metadata_cache_max_bytes,
+        )?;
+        let mut files = super::files::View {
+            snapshot: file_catalog.snapshot(manifest.file_catalog)?,
+            resources,
+            totals: manifest.file_totals.clone(),
+        };
+        files.validate_inventory(&manifest)?;
         let mut strict_series_watermarks = HashMap::<SeriesKey, i64>::new();
         let mut strict_series_watermark_memory = memory_governor
             .try_reserve_token(MemoryClass::SeriesWatermark, 0)
             .ok_or_else(|| corrupt("zero-byte series watermark reservation failed"))?;
-        let mut recovery_read_directory_pages = 0_u64;
-        let mut recovery_read_directory_bytes = 0_u64;
         {
             let mut record_strict_watermark = |series: SeriesKey, timestamp_us: i64| {
+                if deletions.cutoff(series) != 0 {
+                    return Ok(());
+                }
                 if !strict_series_watermarks.contains_key(&series)
                     && !strict_series_watermark_memory.try_grow(APPROXIMATE_SERIES_WATERMARK_BYTES)
                 {
-                    return Err(Error::ResourceLimit(
-                        "strict series watermarks exceed the managed memory limit".into(),
-                    ));
+                    let (limit, used, _, _, watermarks, _, metadata) = memory_governor.stats();
+                    return Err(Error::ResourceLimit(format!(
+                        "strict series watermarks exceed the managed memory limit: \
+                         used {used}/{limit}, watermarks {watermarks}, metadata {metadata}"
+                    )));
                 }
                 strict_series_watermarks
                     .entry(series)
@@ -232,54 +173,94 @@ impl Storage {
                     .or_insert(timestamp_us);
                 Ok(())
             };
-            for directory in &published_read_directories {
-                let (pages, bytes) =
-                    directory.visit_series_max_timestamps(&mut record_strict_watermark)?;
-                recovery_read_directory_pages = recovery_read_directory_pages.saturating_add(pages);
-                recovery_read_directory_bytes = recovery_read_directory_bytes.saturating_add(bytes);
-            }
-            for segment in &segments {
-                if published_read_directories
-                    .iter()
-                    .any(|directory| directory.covers_segment(segment.descriptor()))
-                {
-                    continue;
+            files.all(|entry| {
+                let descriptor = &entry.descriptor;
+                event_watermarks
+                    .entry(descriptor.policy_id)
+                    .and_modify(|watermark| {
+                        *watermark = (*watermark).max(descriptor.max_timestamp_us)
+                    })
+                    .or_insert(descriptor.max_timestamp_us);
+                if entry.directory_id.is_none() {
+                    files
+                        .resources
+                        .open(entry.descriptor, None)?
+                        .visit_series_max_timestamps(
+                            &work_memory_governor,
+                            &mut record_strict_watermark,
+                        )?;
                 }
-                let strictly_increasing = catalog
-                    .policy_by_id(segment.descriptor().policy_id)
-                    .is_some_and(|policy| policy.write_mode == WriteMode::StrictlyIncreasing);
-                if !strictly_increasing {
-                    continue;
+                Ok(())
+            })?;
+        }
+        // Metadata maxima may describe an erased incarnation. Only affected
+        // series need point decoding while barriers remain pending.
+        if !deletions.entries.is_empty() {
+            let _keys_memory = work_memory_governor.reserve_background(
+                WorkMemoryClass::Recovery,
+                deletions.entries.len() as u64 * std::mem::size_of::<SeriesKey>() as u64,
+            )?;
+            let keys = deletions
+                .entries
+                .iter()
+                .map(|m| m.series)
+                .collect::<Vec<_>>();
+            files.all(|entry| {
+                let segment = files.resources.open(entry.descriptor, None)?;
+                if !segment.may_contain_any_series(&keys) {
+                    return Ok(());
                 }
-                segment.visit_series_max_timestamps(&mut record_strict_watermark)?;
-            }
+                let _decode_memory = work_memory_governor
+                    .try_reserve_background_with_headroom(
+                        WorkMemoryClass::Recovery,
+                        segment.descriptor().record_count.min(4096)
+                            * std::mem::size_of::<VersionedPoint>() as u64
+                            * 2,
+                        0,
+                    )?
+                    .ok_or_else(|| {
+                        Error::ResourceLimit("deletion recovery decode memory".into())
+                    })?;
+                let mut cursor = segment.cursor()?;
+                while let Some(point) = cursor.next_operation()? {
+                    let cutoff = deletions.cutoff(point.key.series);
+                    if cutoff == 0 || point.commit_id <= cutoff {
+                        continue;
+                    }
+                    if !strict_series_watermarks.contains_key(&point.key.series)
+                        && !strict_series_watermark_memory
+                            .try_grow(APPROXIMATE_SERIES_WATERMARK_BYTES)
+                    {
+                        return Err(Error::ResourceLimit(
+                            "strict series watermark memory".into(),
+                        ));
+                    }
+                    strict_series_watermarks
+                        .entry(point.key.series)
+                        .and_modify(|last| *last = (*last).max(point.key.timestamp_us))
+                        .or_insert(point.key.timestamp_us);
+                }
+                Ok(())
+            })?;
         }
-        let offline_pack_directory = options
-            .offline_pack_directory
-            .as_deref()
-            .map(|path| {
-                OfflinePackDirectory::open(
-                    path,
-                    &manifest,
-                    &segments,
-                    &memory_governor,
-                    &directory_page_pool,
-                    &file_pool,
-                    Arc::clone(&open_file_cache),
-                    options.metadata_cache_max_bytes,
-                )
-            })
-            .transpose()?;
-        let mut aggregate_archives = Vec::with_capacity(manifest.aggregate_archives.len());
-        for descriptor in manifest.aggregate_archives.iter().cloned() {
-            aggregate_archives.push(Arc::new(AggregateArchive::open(
-                &root,
-                manifest.storage_uuid,
-                descriptor,
-                file_pool.clone(),
-            )?));
-        }
-        let mut recovery_descriptors_nanos = duration_nanos(descriptors_started.elapsed());
+        let offline_pack_directory = if let Some(path) = &options.offline_pack_directory {
+            let mut image = manifest.clone();
+            let (segments, _, _memory) =
+                files.materialize(&mut image, manifest.materialized_commit())?;
+            Some(OfflinePackDirectory::open(
+                path,
+                &image,
+                &segments,
+                &memory_governor,
+                &directory_page_pool,
+                &file_pool,
+                Arc::clone(&open_file_cache),
+                options.metadata_cache_max_bytes,
+            )?)
+        } else {
+            None
+        };
+        let recovery_descriptors_nanos = duration_nanos(descriptors_started.elapsed());
         let materialized_commit = manifest.materialized_commit();
         let wal_directory = root.join("wal");
         let wal_scan_started = Instant::now();
@@ -291,31 +272,45 @@ impl Storage {
             materialized_commit,
             |bytes| work_memory_governor.reserve_background(WorkMemoryClass::Recovery, bytes),
             |frame| {
+                if !frame.deletions.is_empty() {
+                    deletions =
+                        deletions.updated(&frame.deletions, frame.commit_id, &memory_governor)?;
+                    let mut removed = 0;
+                    for key in &frame.deletions {
+                        removed += usize::from(strict_series_watermarks.remove(key).is_some());
+                    }
+                    if removed != 0 {
+                        strict_series_watermarks.shrink_to_fit();
+                        strict_series_watermark_memory
+                            .shrink(removed as u64 * APPROXIMATE_SERIES_WATERMARK_BYTES);
+                    }
+                }
                 for point in &frame.points {
+                    if deletions.hides(*point) {
+                        continue;
+                    }
+
                     let policy = catalog.registered_policy(point.key.series);
                     let policy_id = policy.map_or(1, |policy| policy.id);
-                    if policy
-                        .is_some_and(|policy| policy.write_mode == WriteMode::StrictlyIncreasing)
+
+                    if strict_series_watermarks
+                        .get(&point.key.series)
+                        .is_some_and(|last| point.key.timestamp_us <= *last)
                     {
-                        if point.is_delete
-                            || strict_series_watermarks
-                                .get(&point.key.series)
-                                .is_some_and(|last| point.key.timestamp_us <= *last)
-                        {
-                            return Err(corrupt(
-                                "strictly increasing series contains a repeated, decreasing, or deleted WAL point",
-                            ));
-                        }
-                        if !strict_series_watermarks.contains_key(&point.key.series)
-                            && !strict_series_watermark_memory
-                                .try_grow(APPROXIMATE_SERIES_WATERMARK_BYTES)
-                        {
-                            return Err(Error::ResourceLimit(
-                                "strict series watermarks exceed the managed memory limit".into(),
-                            ));
-                        }
-                        strict_series_watermarks.insert(point.key.series, point.key.timestamp_us);
+                        return Err(corrupt(
+                            "strictly increasing series contains a repeated or decreasing WAL point",
+                        ));
                     }
+                    if !strict_series_watermarks.contains_key(&point.key.series)
+                        && !strict_series_watermark_memory
+                            .try_grow(APPROXIMATE_SERIES_WATERMARK_BYTES)
+                    {
+                        return Err(Error::ResourceLimit(
+                            "strict series watermarks exceed the managed memory limit".into(),
+                        ));
+                    }
+                    strict_series_watermarks.insert(point.key.series, point.key.timestamp_us);
+
                     event_watermarks
                         .entry(policy_id)
                         .and_modify(|watermark| {
@@ -327,6 +322,7 @@ impl Storage {
                     u64::try_from(frame.points.len())
                         .unwrap_or(u64::MAX)
                         .saturating_mul(APPROXIMATE_POINT_BYTES)
+                        .saturating_add(PointBatch::METADATA_BYTES)
                         .saturating_add(std::mem::size_of::<Vec<VersionedPoint>>() as u64),
                 );
                 visible_commit = frame.commit_id;
@@ -334,6 +330,9 @@ impl Storage {
             },
         )?;
         let recovery_wal_scan_nanos = duration_nanos(wal_scan_started.elapsed());
+        if deletions.epoch > visible_commit {
+            return Err(corrupt("deletion barrier exceeds recovered commit"));
+        }
         let strict_write_state = StrictWriteState {
             watermarks: strict_series_watermarks,
             memory: strict_series_watermark_memory,
@@ -343,6 +342,8 @@ impl Storage {
         if recovery_reservation.is_none() {
             block_cache.clear()?;
             metadata_cache.clear()?;
+            file_catalog.clear_cache()?;
+            files.resources.clear()?;
             recovery_reservation =
                 memory_governor.try_reserve_owned(MemoryClass::Memtable, active_bytes);
         }
@@ -360,7 +361,7 @@ impl Storage {
             |bytes| work_memory_governor.reserve_background(WorkMemoryClass::Recovery, bytes),
             |mut frame| {
                 frame.points.sort_unstable();
-                recovered_batches.push(frame.points);
+                recovered_batches.push((frame.commit_id, frame.points));
                 Ok(())
             },
         )?;
@@ -368,37 +369,26 @@ impl Storage {
             || replay_inspection.replay_frames != inspection.replay_frames
             || replay_inspection.replay_operations != inspection.replay_operations
             || replay_inspection.truncated_tail_bytes != inspection.truncated_tail_bytes
+            || replay_inspection.unpublished_paths != inspection.unpublished_paths
+            || replay_inspection.obsolete_empty_paths != inspection.obsolete_empty_paths
         {
             return Err(corrupt("WAL changed between recovery passes"));
         }
         let active_batches = recovered_batches
             .into_iter()
-            .map(|points| {
+            .map(|(commit_id, points)| {
+                if points.is_empty() {
+                    return Arc::new(PointBatch::deletion(
+                        commit_id,
+                        Arc::clone(&recovery_reservation),
+                    ));
+                }
                 Arc::new(PointBatch::managed(
                     points,
                     Arc::clone(&recovery_reservation),
                 ))
             })
             .collect::<Vec<_>>();
-        let optional_roots_started = Instant::now();
-        metadata_cache.clear()?;
-        for segment in &mut segments {
-            if embedded_segment_ids.contains(&segment.descriptor().id) {
-                continue;
-            }
-            *segment = Segment::open_with_file_cache(
-                &root,
-                manifest.storage_uuid,
-                segment.descriptor().clone(),
-                Arc::clone(&block_cache),
-                Arc::clone(&metadata_cache),
-                file_pool.clone(),
-                Arc::clone(&open_file_cache),
-            )?;
-        }
-        recovery_descriptors_nanos = recovery_descriptors_nanos
-            .saturating_add(duration_nanos(optional_roots_started.elapsed()));
-        let segment_index = PublishedSegmentIndex::build(&segments);
         let recovered_cold_commit = active_batches
             .iter()
             .flat_map(|batch| batch.iter())
@@ -416,26 +406,28 @@ impl Storage {
             .map(|point| point.commit_id)
             .max();
         let recovery_wal_replay_nanos = duration_nanos(wal_replay_started.elapsed());
-        if segments
-            .iter()
-            .any(|segment| segment.descriptor().max_commit > visible_commit)
-        {
-            return Err(corrupt(
-                "uncheckpointed segment is not covered by the recovered WAL",
-            ));
-        }
         if offline_pack_directory.is_some() && visible_commit != manifest.checkpoint_commit {
             return Err(invalid(
                 "offline pack directory requires a checkpoint without a WAL tail",
             ));
         }
-        repair_truncated_tail(&wal_directory, &inspection)?;
+        repair_directory(&wal_directory, &inspection)?;
         // Only remove unpublished files after every referenced segment and WAL has
         // been validated. A failed open must preserve recovery evidence.
-        cleanup_unpublished_storage(&root, &manifest)?;
+        file_catalog.finish_recovery(&root)?;
+        files.reconfigure(
+            &mut manifest,
+            &file_catalog,
+            &work_memory_governor,
+            &options,
+        )?;
+        cleanup_unpublished_storage(&root, &files)?;
         let existing_wals = wal_paths(&root.join("wal"))?;
         let recovered_wal_bytes = file_bytes(&existing_wals)?;
-        let initial_wal_id = inspection.maximum_wal_id.saturating_add(1).max(1);
+        let initial_wal_id = inspection
+            .maximum_wal_id
+            .checked_add(1)
+            .ok_or_else(|| corrupt("WAL ID is exhausted"))?;
         let wal = WalWriter::create(
             &root.join("wal"),
             manifest.storage_uuid,
@@ -451,28 +443,25 @@ impl Storage {
         let (history_compaction_tx, history_compaction_rx) =
             bounded(options.history_compaction_queue_capacity);
         let (maintenance_tx, maintenance_rx) = bounded(1);
+        let file_resources = Arc::clone(&files.resources);
         let inner = Arc::new(Inner {
+            deletion_lock: Mutex::new(()),
             root: root.clone(),
             storage_uuid: manifest.storage_uuid,
             options,
-            state: RwLock::new(State {
+            state: super::state::Lock::new(State {
                 visible_commit,
+                materialized_commit,
+                deletions,
                 checkpoint_commit: manifest.checkpoint_commit,
                 active_batches,
                 active_bytes,
                 frozen: Vec::new(),
-                segment_published_at: segments
-                    .iter()
-                    .map(|segment| (segment.descriptor().id, Instant::now()))
-                    .collect(),
-                segments,
-                l1_debt: BTreeMap::new(),
-                published_read_directories,
-                published_read_directory_index,
-                aggregate_archives,
-                segment_index,
+                files,
                 catalog,
                 maintenance_now_us,
+                durable_retention_cutoffs: manifest.retention_cutoffs.clone(),
+                watermark_prune_pending: true,
                 retention_cutoffs,
                 aggregate_retention_cutoffs,
                 event_watermarks,
@@ -488,6 +477,10 @@ impl Storage {
             shutdown_failure: Mutex::new(None),
             degraded: Mutex::new(None),
             metrics: Arc::new(Metrics::default()),
+            #[cfg(feature = "pipeline-trace")]
+            pipeline_trace: std::sync::OnceLock::new(),
+            #[cfg(feature = "publication-diagnostics")]
+            publication_diagnostics: std::sync::OnceLock::new(),
             block_cache,
             metadata_cache,
             memory_governor,
@@ -496,7 +489,9 @@ impl Storage {
             file_pool,
             open_file_cache,
             offline_pack_directory,
-            retired_read_directories: Mutex::new(Vec::new()),
+            file_catalog,
+            file_resources,
+            final_file_stats: Mutex::new(None),
             snapshot_tracker,
             write_regulator,
             query_executor,
@@ -525,14 +520,6 @@ impl Storage {
             .store(recovery_descriptors_nanos, Ordering::Relaxed);
         inner
             .metrics
-            .recovery_read_directory_pages
-            .store(recovery_read_directory_pages, Ordering::Relaxed);
-        inner
-            .metrics
-            .recovery_read_directory_bytes
-            .store(recovery_read_directory_bytes, Ordering::Relaxed);
-        inner
-            .metrics
             .recovery_wal_scan_nanos
             .store(recovery_wal_scan_nanos, Ordering::Relaxed);
         inner
@@ -552,11 +539,6 @@ impl Storage {
             strict: strict_write_state,
         };
 
-        {
-            let mut state = write(&inner.state)?;
-            let shards = state.segment_index.by_shard.keys().copied().collect();
-            refresh_l1_debt(&inner.options, &mut state, &shards);
-        }
         let writer_inner = Arc::clone(&inner);
         let writer = thread::Builder::new()
             .name("chimaera-writer".into())
@@ -624,7 +606,7 @@ impl Storage {
     }
 }
 
-fn cleanup_unpublished_storage(root: &Path, manifest: &Manifest) -> Result<()> {
+fn cleanup_unpublished_storage(root: &Path, files: &super::files::View) -> Result<()> {
     let temporary_directory = root.join("tmp");
     let mut temporary_changed = false;
     for entry in fs::read_dir(&temporary_directory)? {
@@ -652,17 +634,6 @@ fn cleanup_unpublished_storage(root: &Path, manifest: &Manifest) -> Result<()> {
         sync_directory(&temporary_directory)?;
     }
 
-    let artifacts = manifest.data_artifacts()?;
-    let referenced = artifacts
-        .iter()
-        .filter(|artifact| {
-            matches!(
-                artifact.kind,
-                ManifestArtifactKind::Segment | ManifestArtifactKind::PublishedReadDirectory
-            )
-        })
-        .map(|artifact| root.join(&artifact.relative_path))
-        .collect::<HashSet<_>>();
     let mut pending = vec![root.join("segments")];
     let mut changed_directories = HashSet::new();
     while let Some(directory) = pending.pop() {
@@ -685,7 +656,7 @@ fn cleanup_unpublished_storage(root: &Path, manifest: &Manifest) -> Result<()> {
                     || (matches!(
                         path.extension().and_then(|extension| extension.to_str()),
                         Some("tss" | "tsp" | "tspd")
-                    ) && !referenced.contains(&path)))
+                    ) && !files.references_path(&path)?))
             {
                 fs::remove_file(&path)?;
                 changed_directories.insert(directory.clone());
@@ -695,11 +666,6 @@ fn cleanup_unpublished_storage(root: &Path, manifest: &Manifest) -> Result<()> {
     for directory in changed_directories {
         sync_directory(&directory)?;
     }
-    let referenced_archives = artifacts
-        .iter()
-        .filter(|artifact| artifact.kind == ManifestArtifactKind::AggregateArchive)
-        .map(|artifact| root.join(&artifact.relative_path))
-        .collect::<HashSet<_>>();
     let aggregate_directory = root.join("aggregates");
     fs::create_dir_all(&aggregate_directory)?;
     let mut aggregates_changed = false;
@@ -712,7 +678,7 @@ fn cleanup_unpublished_storage(root: &Path, manifest: &Manifest) -> Result<()> {
         }
         if metadata.is_file()
             && path.extension().is_some_and(|extension| extension == "tsa")
-            && !referenced_archives.contains(&path)
+            && !files.references_path(&path)?
         {
             fs::remove_file(path)?;
             aggregates_changed = true;

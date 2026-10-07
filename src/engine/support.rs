@@ -1,14 +1,14 @@
-//! Общие проверки, ожидания каналов и небольшие файловые утилиты.
+//! Shared validation, channel waits, and small filesystem helpers.
 
+use crate::engine::lifecycle::admission::WAIT_SLICE;
 use crate::error::{Error, Result, corrupt, invalid};
-use crate::lifecycle::{OverloadReason, WAIT_SLICE};
 use crate::query::QueryBudget;
 use crate::segment::OperationCursor;
 use crate::types::VersionedPoint;
-use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -65,16 +65,7 @@ pub(super) fn non_empty_cursor(
 }
 
 pub(super) fn wal_paths(directory: &Path) -> Result<Vec<PathBuf>> {
-    if !directory.exists() {
-        return Ok(Vec::new());
-    }
-    let mut paths = fs::read_dir(directory)?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "tsw"))
-        .collect::<Vec<_>>();
-    paths.sort_unstable();
-    Ok(paths)
+    crate::persistence::wal::paths(directory)
 }
 
 pub(super) fn file_bytes(paths: &[PathBuf]) -> Result<u64> {
@@ -135,10 +126,6 @@ pub(super) fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-pub(super) fn duration_micros(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
 pub(super) fn nanos_seconds(nanos: u64) -> f64 {
     nanos as f64 / 1_000_000_000.0
 }
@@ -147,22 +134,12 @@ pub(super) fn micros_seconds(micros: u64) -> f64 {
     micros as f64 / 1_000_000.0
 }
 
-pub(super) fn read<T>(lock: &RwLock<T>) -> Result<std::sync::RwLockReadGuard<'_, T>> {
-    lock.read()
-        .map_err(|_| corrupt("state read lock is poisoned"))
-}
-
-pub(super) fn write<T>(lock: &RwLock<T>) -> Result<std::sync::RwLockWriteGuard<'_, T>> {
-    lock.write()
-        .map_err(|_| corrupt("state write lock is poisoned"))
-}
-
 pub(super) fn lock<T>(lock: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>> {
     lock.lock().map_err(|_| corrupt("mutex is poisoned"))
 }
 
 pub(super) fn validate_batch_len(len: usize) -> Result<()> {
-    if len == 0 || len > 100_000 {
+    if len == 0 || len > super::MAX_BATCH_POINTS {
         return Err(invalid("batch must contain 1..=100000 operations"));
     }
     Ok(())
@@ -217,33 +194,27 @@ pub(super) fn budgeted_sources(
         .collect()
 }
 
+#[track_caller]
 pub(super) fn write_for_query<T>(
-    state: &RwLock<T>,
+    state: &super::state::Lock<T>,
     mut check: impl FnMut() -> Result<()>,
-) -> Result<std::sync::RwLockWriteGuard<'_, T>> {
+) -> Result<super::state::Write<'_, T>> {
     loop {
         check()?;
-        match state.try_write() {
-            Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(corrupt("query state lock is poisoned"));
+        #[cfg(feature = "state-diagnostics")]
+        crate::diagnostics::query::timing::attempt();
+        match state.try_write()? {
+            Some(guard) => return Ok(guard),
+            None => {
+                #[cfg(feature = "state-diagnostics")]
+                let _sleep = {
+                    crate::diagnostics::query::timing::blocked(state.blockers());
+                    crate::diagnostics::query::timing::stage(
+                        crate::diagnostics::query::timing::Stage::SnapshotSleep,
+                    )
+                };
+                thread::sleep(WAIT_SLICE);
             }
-            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(WAIT_SLICE),
         }
-    }
-}
-
-pub(super) fn compaction_admission_error<T>(error: SendTimeoutError<T>) -> Error {
-    match error {
-        SendTimeoutError::Timeout(_) => Error::Overloaded(OverloadReason::CompactionDebt),
-        SendTimeoutError::Disconnected(_) => Error::WorkerStopped,
-    }
-}
-
-pub(super) fn wait_for_compaction(reply: &Receiver<Result<u64>>, deadline: Instant) -> Result<u64> {
-    match reply.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(result) => result,
-        Err(RecvTimeoutError::Timeout) => Err(Error::Overloaded(OverloadReason::CompactionDebt)),
-        Err(RecvTimeoutError::Disconnected) => Err(Error::WorkerStopped),
     }
 }

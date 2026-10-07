@@ -1,6 +1,6 @@
-//! Периодические checkpoint, холодный сброс и обслуживание хранения.
+//! Periodic checkpoints, idle flush, and storage maintenance.
 
-use super::support::{duration_nanos, lock, read};
+use super::support::{duration_nanos, lock};
 use super::{Inner, MaintenanceCommand, OPEN, WriteCommand, degrade};
 use crate::error::Error;
 use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
@@ -19,10 +19,14 @@ pub(super) fn maintenance_loop(inner: Arc<Inner>, receiver: Receiver<Maintenance
         })
         .min(Duration::from_millis(100))
         .max(Duration::from_millis(1));
-    let mut observed_checkpoint = read(&inner.state)
+    let mut observed_checkpoint = inner
+        .state
+        .read()
         .map(|state| state.checkpoint_commit)
         .unwrap_or_default();
     let mut checkpoint_at = Instant::now();
+    let mut retention_at = Instant::now();
+    let mut retention_now = None;
 
     loop {
         match receiver.recv_timeout(poll_interval) {
@@ -36,13 +40,31 @@ pub(super) fn maintenance_loop(inner: Arc<Inner>, receiver: Receiver<Maintenance
             continue;
         }
         let now = Instant::now();
-        let state = match read(&inner.state) {
+        let state = match inner.state.read() {
             Ok(state) => state,
             Err(error) => {
                 degrade(&inner, &error);
                 continue;
             }
         };
+        // Expiry also advances while no writer is flushing. Reuse the bounded,
+        // coalesced wake path; no polling of file metadata on this thread.
+        if now.duration_since(retention_at) >= Duration::from_secs(1) {
+            retention_at = now;
+            let observed = inner.options.clock.now_us();
+            if (retention_now.is_none_or(|previous| observed > previous)
+                && state
+                    .catalog
+                    .policies()
+                    .iter()
+                    .any(|policy| policy.retention_us.is_some()))
+                || (inner.options.retention_repack && state.files.totals.repack_files > 0)
+                || !state.deletions.entries.is_empty()
+            {
+                super::publication::wake_compaction(&inner.compaction_tx);
+                retention_now = Some(observed);
+            }
+        }
         if state.checkpoint_commit != observed_checkpoint {
             observed_checkpoint = state.checkpoint_commit;
             checkpoint_at = now;
@@ -53,6 +75,8 @@ pub(super) fn maintenance_loop(inner: Arc<Inner>, receiver: Receiver<Maintenance
         let checkpoint_due = state.visible_commit > state.checkpoint_commit
             && (uncheckpointed_wal_bytes >= inner.options.wal_checkpoint_bytes
                 || now.duration_since(checkpoint_at) >= inner.options.checkpoint_interval
+                || (!state.deletions.entries.is_empty()
+                    && state.deletions.epoch > state.materialized_commit)
                 || state.last_cold_write.is_some_and(|(_, written_at)| {
                     now.duration_since(written_at) >= inner.options.cold_flush_idle_interval
                 }));

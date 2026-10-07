@@ -1,42 +1,42 @@
-//! Каталог, политики времени, retention и проверка режима записи.
+//! Catalog, time policies, retention, and write-order validation.
 
-use super::compaction_selection::sealed_before_for_policy;
-use super::support::{read, write};
 use super::{Inner, PublishCommand, State, Storage, WriteCommand};
 use crate::catalog::{
     BucketDefinition, CatalogSnapshot, CompressionProfile, PolicySelector, RetentionInfo,
-    SeriesRef, SeriesStorageInfo, SpaceDefinition, StoragePolicy, StoragePolicyOptions, WriteMode,
+    SeriesRef, SeriesStorageInfo, SpaceDefinition, StoragePolicy, StoragePolicyOptions,
     validate_name,
 };
+use crate::engine::lifecycle::admission::OverloadReason;
 use crate::error::{Error, Result, invalid};
-use crate::layout::Domain;
-use crate::lifecycle::OverloadReason;
-use crate::types::{DAY_US, SeriesKey, WriteOperation};
+use crate::persistence::layout::Domain;
+use crate::types::{DAY_US, Point, SeriesKey};
 use crossbeam_channel::bounded;
 use std::collections::HashMap;
 
 impl Storage {
-    /// Возвращает неизменяемый снимок долговечного каталога.
+    /// Return an immutable snapshot of the durable catalog.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку, если база закрыта или внутренняя блокировка повреждена.
+    /// Returns an error if storage is closed or an internal lock is poisoned.
     pub fn catalog(&self) -> Result<CatalogSnapshot> {
         self.ensure_available()?;
-        Ok(read(&self.inner.state)?.catalog.clone())
+        Ok(self.inner.state.read()?.catalog.clone())
     }
 
-    /// Возвращает гарантированные границы исходных данных, сводок и исправлений.
+    /// Return effective raw/aggregate retention cutoffs and the observed event end.
+    /// These are not complete write-admission bounds: timestamp order, maximum
+    /// lateness, and future-skew checks apply separately.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку для неизвестной политики, закрытой базы или повреждённой
-    /// внутренней блокировки.
+    /// Returns an error for an unknown policy, unavailable storage, or a poisoned
+    /// internal lock.
     pub fn retention_info(&self, policy: impl Into<PolicySelector>) -> Result<RetentionInfo> {
         self.ensure_available()?;
         let selector = policy.into();
         let now_us = self.inner.options.clock.now_us();
-        let mut state = write(&self.inner.state)?;
+        let mut state = self.inner.state.write()?;
         state.maintenance_now_us = state.maintenance_now_us.max(now_us);
         let policy = match &selector {
             PolicySelector::Id(id) => state.catalog.policy_by_id(*id),
@@ -66,25 +66,25 @@ impl Storage {
         })
     }
 
-    /// Возвращает границы хранения для числового ключа ряда.
+    /// Return retention boundaries for a registered numeric series key.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку для незарегистрированного ряда или недоступной базы.
+    /// Returns an error for an unregistered series or unavailable storage.
     pub fn series_info(&self, series: SeriesKey) -> Result<SeriesStorageInfo> {
         self.ensure_available()?;
-        let policy_id = read(&self.inner.state)?.catalog.policy_for(series)?.id;
+        let policy_id = self.inner.state.read()?.catalog.policy_for(series)?.id;
         Ok(SeriesStorageInfo {
             series,
             retention: self.retention_info(policy_id)?,
         })
     }
 
-    /// Создаёт пространство после атомарной публикации манифеста.
+    /// Create a space through atomic manifest publication.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку имени, конфликта, I/O или остановленного publisher-а.
+    /// Returns name, conflict, I/O, or stopped-publisher errors.
     pub fn create_space(&self, name: impl Into<String>) -> Result<SpaceDefinition> {
         self.ensure_writable()?;
         let name = name.into();
@@ -103,11 +103,11 @@ impl Storage {
         )
     }
 
-    /// Создаёт неизменяемую политику после атомарной публикации манифеста.
+    /// Create an immutable policy through atomic manifest publication.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку параметров, конфликта, I/O или остановленного publisher-а.
+    /// Returns parameter, conflict, I/O, or stopped-publisher errors.
     pub fn create_policy(&self, options: StoragePolicyOptions) -> Result<StoragePolicy> {
         self.ensure_writable()?;
         options.validate()?;
@@ -124,11 +124,11 @@ impl Storage {
         )
     }
 
-    /// Создаёт bucket в существующем пространстве с выбранной политикой.
+    /// Create a bucket in an existing space with the selected policy.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку имени, отсутствующей ссылки, конфликта, I/O или publisher-а.
+    /// Returns name, missing-reference, conflict, I/O, or publisher errors.
     pub fn create_bucket(
         &self,
         space: impl Into<String>,
@@ -156,11 +156,11 @@ impl Storage {
         )
     }
 
-    /// Разрешает логическое имя ряда через текущий снимок каталога.
+    /// Resolve a logical series name using the current catalog snapshot.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку закрытой базы или отсутствующей записи каталога.
+    /// Returns closed-storage or missing-catalog-entry errors.
     pub fn resolve_series(&self, series: &SeriesRef) -> Result<(SeriesKey, StoragePolicy)> {
         self.catalog()?.resolve(series)
     }
@@ -187,54 +187,29 @@ pub(super) fn storage_domain(
 
 pub(super) fn validate_registered_write_times(
     inner: &Inner,
-    writes: &[WriteOperation],
+    writes: &[Point],
     observed_now_us: i64,
 ) -> Result<()> {
-    let mut state = write(&inner.state)?;
+    let mut state = inner.state.write()?;
     state.maintenance_now_us = state.maintenance_now_us.max(observed_now_us);
     let now_us = state.maintenance_now_us;
     let catalog = state.catalog.clone();
     for operation in writes {
-        if let Some(policy) = catalog.registered_policy(operation.series()) {
-            validate_write_time(&mut state, policy, operation.timestamp_us(), now_us)?;
-            if policy.write_mode == WriteMode::StrictlyIncreasing
-                && policy.max_future_skew_us.is_some()
-                && sealed_before_for_policy(
-                    &inner.options,
-                    &catalog,
-                    &state.event_watermarks,
-                    policy.id,
-                )
-                .is_some_and(|sealed_before_us| operation.timestamp_us() < sealed_before_us)
-            {
-                return Err(Error::ExpiredPoint(
-                    "strict point is older than the sealed policy boundary".into(),
-                ));
-            }
+        if let Some(policy) = catalog.registered_policy(operation.series) {
+            validate_write_time(&mut state, policy, operation.timestamp_us, now_us)?;
         }
     }
     Ok(())
 }
 
 pub(super) fn validate_strict_writes(
-    inner: &Inner,
-    writes: &[WriteOperation],
+    writes: &[Point],
     watermarks: &HashMap<SeriesKey, i64>,
 ) -> Result<Vec<(SeriesKey, i64)>> {
-    let state = read(&inner.state)?;
     let mut updates = HashMap::<SeriesKey, i64>::new();
     for operation in writes {
-        let series = operation.series();
-        let Some(policy) = state.catalog.registered_policy(series) else {
-            continue;
-        };
-        if policy.write_mode != WriteMode::StrictlyIncreasing {
-            continue;
-        }
-        if matches!(operation, WriteOperation::Delete { .. }) {
-            return Err(invalid("strictly increasing series does not allow delete"));
-        }
-        let timestamp_us = operation.timestamp_us();
+        let series = operation.series;
+        let timestamp_us = operation.timestamp_us;
         match updates.entry(series) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 if timestamp_us <= *entry.get() {
@@ -266,7 +241,7 @@ pub(super) fn ensure_series_namespace_unused(
     bucket_id: u32,
 ) -> Result<()> {
     let (batches, segments) = {
-        let state = read(&inner.state)?;
+        let state = inner.state.read()?;
         let mut batches = state.active_batches.clone();
         batches.extend(
             state
@@ -274,7 +249,7 @@ pub(super) fn ensure_series_namespace_unused(
                 .iter()
                 .flat_map(|generation| generation.batches.iter().cloned()),
         );
-        (batches, state.segments.clone())
+        (batches, state.files.clone())
     };
     if batches.iter().any(|batch| {
         batch.iter().any(|point| {
@@ -285,14 +260,15 @@ pub(super) fn ensure_series_namespace_unused(
             "numeric series namespace already contains data: {space_id}/{bucket_id}"
         )));
     }
-    for segment in segments {
+    segments.all(|entry| {
+        let segment = segments.resources.open(entry.descriptor, None)?;
         if segment.contains_series_namespace(space_id, bucket_id)? {
             return Err(Error::Catalog(format!(
                 "numeric series namespace already contains data: {space_id}/{bucket_id}"
             )));
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub(super) fn compression_profile_for_domain(

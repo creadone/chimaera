@@ -1,28 +1,28 @@
-//! Физические снимки Storage и потоковый JSONL import/export.
+//! Physical storage snapshots and streaming JSONL import/export.
 
 use super::read::PointStream;
 use super::{Snapshot, Storage, WriteCommand};
+use crate::admin::exchange::{ExportOptions, ExportResult, ImportOptions, ImportResult};
+use crate::admin::snapshot::{SnapshotImage, SnapshotInfo, restore_snapshot, write_snapshot};
+use crate::engine::lifecycle::admission::OverloadReason;
 use crate::error::{Error, Result};
-use crate::exchange::{ExportOptions, ExportResult, ImportOptions, ImportResult};
-use crate::lifecycle::OverloadReason;
 use crate::segment::{OfflinePackDirectory, OfflinePackDirectoryInfo, Segment};
-use crate::snapshot::{SnapshotImage, SnapshotInfo, restore_snapshot, write_snapshot};
 use crossbeam_channel::bounded;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
 impl Storage {
-    /// Создаёт атомарно опубликованный физический snapshot без WAL.
+    /// Create an atomically published physical snapshot without WAL.
     ///
-    /// Writer останавливается только на время checkpoint и фиксации списка файлов.
-    /// Копирование выполняется после снятия барьера, а удерживаемые ссылки не дают
-    /// compaction reaper удалить входные pack-файлы.
+    /// The writer pauses only for checkpoint and catalogue-root capture.
+    /// Copying runs after this barrier; the retained generation prevents
+    /// the compaction reaper from deleting source packs.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку checkpoint, повреждения исходного образа, существующего
-    /// каталога назначения или файлового I/O.
+    /// Returns checkpoint, corrupt-source, existing-destination,
+    /// or filesystem I/O errors.
     pub fn snapshot(&self, destination: impl AsRef<Path>) -> Result<SnapshotInfo> {
         self.ensure_writable()?;
         let _storage_lock = self.clone_storage_lock()?;
@@ -35,11 +35,11 @@ impl Storage {
         )
     }
 
-    /// Восстанавливает WAL-free snapshot в новый атомарно публикуемый каталог.
+    /// Restore a WAL-free snapshot into a new, atomically published directory.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку проверки snapshot, существующего назначения или I/O.
+    /// Returns snapshot-verification, existing-destination, or I/O errors.
     pub fn restore_snapshot(
         snapshot: impl AsRef<Path>,
         destination: impl AsRef<Path>,
@@ -47,14 +47,17 @@ impl Storage {
         restore_snapshot(snapshot.as_ref(), destination.as_ref())
     }
 
-    /// Потоково записывает логическую JSONL-выгрузку одного commit ID.
+    /// Stream a logical JSONL export from one commit ID.
     ///
-    /// В начале выгрузки публикуется checkpoint, после чего запись может
-    /// продолжаться одновременно с обходом удерживаемых immutable segment-файлов.
+    /// A checkpoint is published first; writes can then continue
+    /// while export traverses the retained immutable segment files.
+    /// Every discovered series must belong to a registered bucket and policy.
+    /// Use a physical snapshot for databases with unregistered numeric namespaces.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку лимита, checkpoint, декодирования сегмента, JSON или I/O.
+    /// Returns `NotFound` for an unregistered bucket/policy, or limit,
+    /// checkpoint, segment-decoding, JSON, or I/O errors.
     pub fn export_jsonl<W: std::io::Write>(
         &self,
         writer: W,
@@ -63,15 +66,38 @@ impl Storage {
         self.ensure_writable()?;
         let storage_lock = self.clone_storage_lock()?;
         options.validate()?;
-        let image = self.capture_checkpoint_image()?;
+        let mut image = self.capture_checkpoint_image()?;
+        // Logical export retains its existing, explicitly budgeted image.
+        // Physical snapshot/restore do not need these per-segment handles.
+        let commit = image.manifest.checkpoint_commit;
+        let (segments, _archives, _image_memory) =
+            image.file_view.materialize(&mut image.manifest, commit)?;
+        let mut memory = self
+            .inner
+            .work_memory_governor
+            .reserve_background(crate::memory::work::WorkMemoryClass::QuerySources, 0)?;
         let mut series = BTreeSet::new();
-        for segment in &image.segments {
-            for series_key in segment.series_keys()? {
-                series.insert(series_key);
-                if series.len() > options.max_series {
-                    return Err(Error::ResourceLimit("export series limit exceeded".into()));
-                }
-            }
+        for segment in &segments {
+            segment.visit_series_max_timestamps(
+                &self.inner.work_memory_governor,
+                |series_key, _| {
+                    if !series.contains(&series_key) {
+                        if series.len() >= options.max_series {
+                            return Err(Error::ResourceLimit(
+                                "export series limit exceeded".into(),
+                            ));
+                        }
+                        // B-tree entry, collected key vector and retention hash table.
+                        if !memory.try_grow(256)? {
+                            return Err(Error::ResourceLimit(
+                                "export series exceed work memory".into(),
+                            ));
+                        }
+                        series.insert(series_key);
+                    }
+                    Ok(())
+                },
+            )?;
         }
         let series = series.into_iter().collect::<Vec<_>>();
         let catalog = image.manifest.catalog.snapshot();
@@ -83,13 +109,15 @@ impl Storage {
             }
         }
         let mut segments_by_shard = BTreeMap::<u16, Vec<Arc<Segment>>>::new();
-        for segment in image.segments {
+        for segment in segments {
             segments_by_shard
                 .entry(segment.descriptor().shard_id)
                 .or_default()
                 .push(segment);
         }
         let snapshot = Snapshot {
+            deletions: Arc::clone(&image.manifest.deletions),
+            file_view: Some(image.file_view),
             commit_id: image.manifest.checkpoint_commit,
             virtual_shards: image.manifest.virtual_shards,
             batches: Vec::new(),
@@ -98,19 +126,17 @@ impl Storage {
             aggregate_retention_cutoffs: HashMap::new(),
             retained_aggregate_resolutions: HashMap::new(),
             series_policy_ids: HashMap::new(),
-            strictly_increasing_series: HashSet::new(),
             aggregate_archives: Vec::new(),
-            published_read_directories: Vec::new(),
             metrics: Arc::clone(&self.inner.metrics),
-            open_file_cache: Arc::clone(&self.inner.open_file_cache),
             offline_pack_directory: None,
             guard: None,
             write_regulator: None,
             query_executor: Arc::clone(&self.inner.query_executor),
             work_memory_governor: Arc::clone(&self.inner.work_memory_governor),
             storage_lock: Some(storage_lock),
+            memory: None,
         };
-        crate::exchange::export_jsonl(
+        crate::admin::exchange::export_jsonl(
             writer,
             options,
             self.inner.options.clock.now_us(),
@@ -121,21 +147,21 @@ impl Storage {
         )
     }
 
-    /// Потоково загружает JSONL по ограниченным атомарным batch.
+    /// Import JSONL using bounded atomic batches; the whole import is not atomic.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку формата, лимита, каталога, WAL, checkpoint или I/O.
+    /// Returns format, limit, catalog, WAL, checkpoint, or I/O errors.
     pub fn import_jsonl<R: std::io::Read>(
         &self,
         reader: R,
         options: ImportOptions,
     ) -> Result<ImportResult> {
         self.ensure_writable()?;
-        crate::exchange::import_jsonl(self, reader, options)
+        crate::admin::exchange::import_jsonl(self, reader, options)
     }
 
-    fn capture_checkpoint_image(&self) -> Result<SnapshotImage> {
+    pub(super) fn capture_checkpoint_image(&self) -> Result<SnapshotImage> {
         let (reply_tx, reply_rx) = bounded(1);
         self.request_command(
             &self.inner.write_tx,
@@ -146,20 +172,24 @@ impl Storage {
         )
     }
 
-    /// Строит checksummed directory прямых block locator для текущего checkpoint.
+    /// Build a checksummed directory of direct block locators for the current checkpoint.
     ///
-    /// Артефакт предназначен только для архитектурного query-only A/B и должен
-    /// передаваться следующему [`Self::open`] через [`crate::OpenOptions::offline_pack_directory`].
+    /// This artifact is for experimental query-only comparisons. Pass it to
+    /// the next [`Self::open`] through [`crate::OpenOptions::offline_pack_directory`].
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку checkpoint, чтения metadata, лимита или существующего output.
+    /// Returns checkpoint, metadata-read, resource-limit, or existing-output errors.
     pub fn build_offline_pack_directory(
         &self,
         output: impl AsRef<Path>,
     ) -> Result<OfflinePackDirectoryInfo> {
         self.ensure_writable()?;
-        let image = self.capture_checkpoint_image()?;
-        OfflinePackDirectory::build(output.as_ref(), &image.manifest, &image.segments)
+        let mut image = self.capture_checkpoint_image()?;
+        // This experimental export still explicitly needs a full segment image.
+        let commit = image.manifest.checkpoint_commit;
+        let (segments, _archives, _memory) =
+            image.file_view.materialize(&mut image.manifest, commit)?;
+        OfflinePackDirectory::build(output.as_ref(), &image.manifest, &segments)
     }
 }

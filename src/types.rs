@@ -12,8 +12,10 @@ pub const DAY_US: i64 = 86_400_000_000;
 pub const HOUR_US: i64 = 3_600_000_000;
 pub const MINUTE_US: i64 = 60_000_000;
 
-/// Полный ключ ряда формата Chimaera v1.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+/// Full series identity: space, bucket, and numeric key.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 pub struct SeriesKey {
     pub space_id: u32,
     pub bucket_id: u32,
@@ -31,7 +33,7 @@ impl SeriesKey {
     }
 }
 
-/// Входная точка пакетной записи.
+/// An input point for an atomic batch write.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     pub series: SeriesKey,
@@ -39,55 +41,12 @@ pub struct Point {
     pub value: f64,
 }
 
-/// Одна операция атомарного пакета записи.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum WriteOperation {
-    /// Создать или заменить точку.
-    Put(Point),
-    /// Удалить видимую версию точки, если она существует.
-    Delete {
-        series: SeriesKey,
-        timestamp_us: i64,
-    },
-}
-
-impl WriteOperation {
-    /// Создаёт идемпотентное удаление точки.
-    #[must_use]
-    pub const fn delete(series: SeriesKey, timestamp_us: i64) -> Self {
-        Self::Delete {
-            series,
-            timestamp_us,
-        }
-    }
-
-    pub(crate) const fn series(self) -> SeriesKey {
-        match self {
-            Self::Put(point) => point.series,
-            Self::Delete { series, .. } => series,
-        }
-    }
-
-    pub(crate) const fn timestamp_us(self) -> i64 {
-        match self {
-            Self::Put(point) => point.timestamp_us,
-            Self::Delete { timestamp_us, .. } => timestamp_us,
-        }
-    }
-}
-
-impl From<Point> for WriteOperation {
-    fn from(point: Point) -> Self {
-        Self::Put(point)
-    }
-}
-
 impl Point {
-    /// Создаёт точку и отклоняет NaN/Infinity до записи в WAL.
+    /// Create a point, rejecting NaN and infinity before WAL writing.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку, если `value` не является конечным числом.
+    /// Returns an error when `value` is not finite.
     pub fn new(series: SeriesKey, timestamp_us: i64, value: f64) -> Result<Self> {
         if !value.is_finite() {
             return Err(invalid("point value must be finite"));
@@ -124,16 +83,11 @@ impl PartialOrd for PointKey {
 pub(crate) struct VersionedPoint {
     pub key: PointKey,
     pub commit_id: u64,
-    pub ordinal: u32,
     pub value_bits: u64,
-    pub is_delete: bool,
 }
 
 impl VersionedPoint {
     pub fn put_value(self) -> Result<f64> {
-        if self.is_delete {
-            return Err(corrupt("delete operation has no value"));
-        }
         Ok(f64::from_bits(self.value_bits))
     }
 }
@@ -142,9 +96,7 @@ impl PartialEq for VersionedPoint {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
             && self.commit_id == other.commit_id
-            && self.ordinal == other.ordinal
             && self.value_bits == other.value_bits
-            && self.is_delete == other.is_delete
     }
 }
 
@@ -155,7 +107,6 @@ impl Ord for VersionedPoint {
         self.key
             .cmp(&other.key)
             .then_with(|| self.commit_id.cmp(&other.commit_id))
-            .then_with(|| self.ordinal.cmp(&other.ordinal))
     }
 }
 
@@ -165,32 +116,15 @@ impl PartialOrd for VersionedPoint {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Durability {
-    Sync,
-    GroupCommit,
-    Async,
-}
-
-impl Durability {
-    pub(crate) const fn wal_flag(self) -> u16 {
-        match self {
-            Self::Sync => 1,
-            Self::GroupCommit => 2,
-            Self::Async => 4,
-        }
-    }
-}
-
+/// An atomic-batch receipt returned after WAL synchronization and publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteReceipt {
     pub commit_id: u64,
     pub operation_count: u32,
     pub point_count: u32,
-    pub durable: bool,
 }
 
-/// Единица календарной группировки.
+/// A calendar grouping unit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CalendarUnit {
     Day,
@@ -201,7 +135,7 @@ pub enum CalendarUnit {
     Year,
 }
 
-/// Первый день календарной недели.
+/// The first day of a calendar week.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WeekStart {
     Monday,
@@ -227,7 +161,7 @@ impl WeekStart {
     }
 }
 
-/// Календарная группировка с правилами встроенной базы IANA.
+/// Calendar grouping using the bundled IANA time-zone rules.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CalendarGrouping {
     unit: CalendarUnit,
@@ -236,11 +170,11 @@ pub struct CalendarGrouping {
 }
 
 impl CalendarGrouping {
-    /// Проверяет имя IANA и создаёт календарную группировку.
+    /// Validate an IANA name and create a calendar grouping.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку для неизвестной timezone.
+    /// Returns an error for an unknown time zone.
     pub fn new(unit: CalendarUnit, timezone: &str, week_start: WeekStart) -> Result<Self> {
         let timezone = timezone
             .parse::<Tz>()
@@ -267,11 +201,11 @@ impl CalendarGrouping {
         self.week_start
     }
 
-    /// Возвращает календарную корзину, содержащую timestamp.
+    /// Return the calendar bucket containing the timestamp.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку вне диапазона календаря или `i64` микросекунд.
+    /// Returns an error outside the calendar or `i64` microsecond range.
     pub fn bucket(self, timestamp_us: i64) -> Result<TimeBucket> {
         let utc = chrono::DateTime::<Utc>::from_timestamp_micros(timestamp_us)
             .ok_or_else(|| invalid("timestamp is outside the supported calendar range"))?;
@@ -351,25 +285,25 @@ fn resolve_local_boundary(timezone: Tz, date: NaiveDate) -> Result<chrono::DateT
     Err(invalid("IANA timezone gap exceeds two days"))
 }
 
-/// Проверенные границы одной временной корзины.
+/// Validated bounds of one time bucket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimeBucket {
     pub start_us: i64,
     pub end_us: i64,
 }
 
-/// Способ разбиения времени в потоковом запросе.
+/// Time partitioning for a streaming query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Grouping {
-    /// Календарные сутки UTC, совместимые с дневной aggregate-секцией v1.
+    /// UTC calendar days, compatible with daily summaries.
     UtcDay,
-    /// Равные интервалы в микросекундах относительно заданного origin.
+    /// Equal intervals in microseconds relative to the specified origin.
     Fixed { duration_us: i64, origin_us: i64 },
-    /// Календарная единица в timezone IANA.
+    /// A calendar unit in an IANA time zone.
     Calendar(CalendarGrouping),
 }
 
-/// Точное разрешение одной сохраняемой сводки.
+/// The exact resolution of a persisted summary.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AggregateResolution {
@@ -406,10 +340,10 @@ impl AggregateResolution {
     }
 }
 
-/// Набор результатов, вычисляемых одним проходом по видимым точкам.
+/// Aggregate results computed in one pass over visible points.
 ///
-/// `count` и `sum` входят в любой групповой запрос и остаются обычными полями
-/// [`GroupRow`]. Остальные флаги управляют дополнительными полями строки.
+/// `count` and `sum` are included in every grouping query as regular fields of
+/// [`GroupRow`]. Other flags select additional result fields.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AggregateSet(u16);
 
@@ -466,20 +400,23 @@ impl BitOrAssign for AggregateSet {
     }
 }
 
-/// Значение на определённой отметке времени для `first` и `last`.
+/// A timestamped value returned by `first` or `last`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AggregatePoint {
     pub timestamp_us: i64,
     pub value: f64,
 }
 
-/// Источник данных для группового запроса.
+/// Data source selection for a grouping query.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GroupSource {
-    /// Использовать точные сохранённые сводки, когда они полностью покрывают запрос.
+    /// Use exact persisted summaries where they fully cover the requested portion.
+    /// History is bounded by raw and archive retention. An unpublished archive
+    /// or insufficient precision for the range or grouping yields
+    /// `Error::QueryUnavailable`, never a successful partial answer.
     #[default]
     Auto,
-    /// Всегда читать исходные MVCC-операции.
+    /// Read only raw points within their retention, without archives.
     Raw,
 }
 
@@ -493,11 +430,11 @@ impl Grouping {
         Ok(())
     }
 
-    /// Возвращает временную корзину, содержащую timestamp.
+    /// Return the time bucket containing the timestamp.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку при переполнении границ или календаря.
+    /// Returns an error for overflowing bounds or an unsupported calendar timestamp.
     pub fn bucket(self, timestamp_us: i64) -> Result<TimeBucket> {
         self.validate()?;
         if let Self::Calendar(calendar) = self {
@@ -563,7 +500,8 @@ impl Grouping {
     }
 }
 
-/// Потоковый запрос с полуоткрытым диапазоном `[from_us, to_us)`.
+/// A streaming query over the half-open range `[from_us, to_us)`.
+/// Selected keys must be unique and belong to one space and bucket.
 #[derive(Clone, Debug)]
 pub struct GroupRequest {
     pub series: Vec<SeriesKey>,
@@ -576,22 +514,23 @@ pub struct GroupRequest {
     pub options: QueryOptions,
 }
 
-/// Область агрегации нескольких рядов.
+/// How multiple series contribute to aggregate buckets.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GroupScope {
-    /// Возвращает независимый поток корзин для каждого ряда.
+    /// Return an independent sequence of buckets for each series.
     #[default]
     PerKey,
-    /// Объединяет значения всех рядов в один поток временных корзин.
+    /// Merge values from all series into one sequence of time buckets.
     Combined,
 }
 
 impl GroupRequest {
-    /// Проверяет границы и набор рядов.
+    /// Validate the range and selected series.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку для пустого набора, повторов или пустого диапазона.
+    /// Returns an error for no series, duplicate keys, keys from different spaces
+    /// or buckets, an empty/reversed range, or a series count above the query limit.
     pub fn new(series: Vec<SeriesKey>, from_us: i64, to_us: i64) -> Result<Self> {
         let request = Self {
             series,
@@ -633,11 +572,11 @@ impl GroupRequest {
         self.grouping.validate()
     }
 
-    /// Создаёт запрос с равными корзинами `duration_us` относительно `origin_us`.
+    /// Create equal `duration_us` buckets relative to `origin_us`.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку для неположительной длительности и неверного диапазона.
+    /// Returns an error for a nonpositive duration or invalid range.
     pub fn fixed(
         series: Vec<SeriesKey>,
         from_us: i64,
@@ -654,11 +593,11 @@ impl GroupRequest {
         Ok(request)
     }
 
-    /// Создаёт календарный запрос в timezone IANA.
+    /// Create a calendar query in an IANA time zone.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку для неизвестной timezone или неверного запроса.
+    /// Returns an error for an unknown time zone or invalid query.
     pub fn calendar(
         series: Vec<SeriesKey>,
         from_us: i64,
@@ -673,15 +612,15 @@ impl GroupRequest {
         Ok(request)
     }
 
-    /// Создаёт точную агрегацию с числом строк порядка `target_rows`.
+    /// Create an exact grouping with a bucket count on the order of `target_rows`.
     ///
-    /// Длительность округляется вверх до целой минуты, часа или суток. Если
-    /// подходящая сохранённая сводка отсутствует, запрос остаётся точным и читает
-    /// исходные точки.
+    /// Round the duration up to a whole minute, hour, or day. If a suitable
+    /// summary is absent, use raw points where retained; otherwise exact-answer
+    /// availability follows [`GroupSource`].
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку для нулевого числа строк или переполнения интервала.
+    /// Returns an error for a zero target count or interval overflow.
     pub fn downsampled(
         series: Vec<SeriesKey>,
         from_us: i64,
@@ -712,32 +651,32 @@ impl GroupRequest {
         Self::fixed(series, from_us, to_us, duration_us, 0)
     }
 
-    /// Устанавливает область агрегации.
+    /// Set the grouping scope.
     #[must_use]
     pub const fn with_scope(mut self, scope: GroupScope) -> Self {
         self.scope = scope;
         self
     }
 
-    /// Выбирает дополнительные результаты, вычисляемые в том же проходе.
+    /// Select additional results computed in the same pass.
     #[must_use]
     pub const fn with_aggregates(mut self, aggregates: AggregateSet) -> Self {
         self.aggregates = aggregates;
         self
     }
 
-    /// Требует исходные точки либо разрешает планировщику выбрать сводку.
+    /// Require raw points or allow the query planner to use summaries.
     #[must_use]
     pub const fn with_source(mut self, source: GroupSource) -> Self {
         self.source = source;
         self
     }
 
-    /// Устанавливает deadline, cancellation token и пределы ресурсов.
+    /// Set a deadline, cancellation token, and resource limits.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку, если пределы не положительны или уже превышены запросом.
+    /// Returns an error for nonpositive limits or limits already exceeded by this request.
     pub fn with_options(mut self, options: QueryOptions) -> Result<Self> {
         self.options = options;
         self.validate()?;
@@ -745,16 +684,16 @@ impl GroupRequest {
     }
 }
 
-/// Одна непустая временная корзина.
+/// One nonempty time bucket.
 #[derive(Clone, Copy, Debug)]
 pub struct GroupRow {
-    /// Ключ ряда для `PerKey`; отсутствует для `Combined`.
+    /// Series key for `PerKey`; absent for `Combined`.
     pub series: Option<SeriesKey>,
     pub bucket_start_us: i64,
     pub bucket_end_us: i64,
-    /// Фактическая ширина этой строки; календарные строки могут различаться.
+    /// Actual width of this row; calendar bucket widths may differ.
     pub resolution_us: i64,
-    /// Разрешение сохранённой сводки, если строка получена без чтения исходных точек.
+    /// Summary resolution when this row was produced without reading raw points.
     pub source_resolution: Option<AggregateResolution>,
     pub sum: f64,
     pub count: u64,
@@ -769,7 +708,7 @@ pub struct GroupRow {
     pub first: Option<AggregatePoint>,
     pub last: Option<AggregatePoint>,
     pub delta: Option<f64>,
-    /// Изменение значения за секунду между первой и последней точкой.
+    /// Value change per second between the first and last points.
     pub rate_per_second: Option<f64>,
     state: AggregateState,
 }
@@ -894,12 +833,6 @@ impl GroupRow {
     }
 }
 
-pub(crate) fn utc_day_start(timestamp_us: i64) -> Result<i64> {
-    Grouping::UtcDay
-        .bucket_bounds(timestamp_us)
-        .map(|(start, _)| start)
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NeumaierSum {
     sum: f64,
@@ -917,12 +850,6 @@ pub(crate) struct AggregateState {
     pub first: Option<AggregatePoint>,
     pub last: Option<AggregatePoint>,
     pub available: AggregateSet,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RemovalSafety {
-    pub extrema: bool,
-    pub edges: bool,
 }
 
 impl Default for AggregateState {
@@ -1110,36 +1037,8 @@ impl AggregateState {
         self.validate()
     }
 
-    pub(crate) fn remove(&mut self, timestamp_us: i64, value: f64) -> Result<RemovalSafety> {
-        if self.count == 0 {
-            return Err(corrupt("aggregate removal underflow"));
-        }
-        let safety = RemovalSafety {
-            extrema: value != self.min && value != self.max,
-            edges: self
-                .first
-                .is_some_and(|point| point.timestamp_us != timestamp_us)
-                && self
-                    .last
-                    .is_some_and(|point| point.timestamp_us != timestamp_us),
-        };
-        self.sum.add(-value);
-        if self.count == 1 {
-            *self = Self::default();
-            return Ok(safety);
-        }
-        let next_count = self.count - 1;
-        let next_mean = (self.mean * self.count as f64 - value) / next_count as f64;
-        self.m2 -= (value - self.mean) * (value - next_mean);
-        if self.m2 < 0.0 && self.m2 > -f64::EPSILON * self.mean.abs().max(1.0).powi(2) {
-            self.m2 = 0.0;
-        }
-        self.mean = next_mean;
-        self.count = next_count;
-        self.validate()?;
-        Ok(safety)
-    }
-
+    /// `None` leaves the state unchanged: inverse moments lost numeric validity
+    /// and the caller must recompute the requested aggregate from visible points.
     pub(crate) fn total(self) -> Result<f64> {
         let (raw_sum, compensation) = self.sum.components();
         let total = raw_sum + compensation;
@@ -1211,40 +1110,5 @@ impl NeumaierSum {
     #[must_use]
     pub const fn components(self) -> (f64, f64) {
         (self.sum, self.compensation)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
-
-    #[test]
-    fn fixed_grouping_rejects_non_positive_duration_in_public_bucket_api() {
-        for duration_us in [0, -1] {
-            let grouping = Grouping::Fixed {
-                duration_us,
-                origin_us: 0,
-            };
-            assert!(matches!(grouping.bucket(1), Err(Error::Invalid(_))));
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn streaming_state_matches_two_pass_reference(values in proptest::collection::vec(-1.0e6_f64..1.0e6_f64, 1..512)) {
-            let mut state = AggregateState::default();
-            for (index, value) in values.iter().copied().enumerate() {
-                state.add(index as i64 - 256, value)?;
-            }
-            let count = values.len() as f64;
-            let mean = values.iter().sum::<f64>() / count;
-            let m2 = values.iter().map(|value| (value - mean).powi(2)).sum::<f64>();
-            let tolerance = 1.0e-8_f64.max(m2.abs() * 1.0e-10);
-            prop_assert_eq!(state.count, values.len() as u64);
-            prop_assert_eq!(state.min, values.iter().copied().fold(f64::INFINITY, f64::min));
-            prop_assert_eq!(state.max, values.iter().copied().fold(f64::NEG_INFINITY, f64::max));
-            prop_assert!((state.m2 - m2).abs() <= tolerance);
-        }
     }
 }

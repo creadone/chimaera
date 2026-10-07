@@ -1,6 +1,6 @@
 use std::io;
 
-/// Ошибка хранилища Chimaera.
+/// An error returned by Chimaera.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
@@ -35,6 +35,9 @@ pub enum Error {
     Backpressure,
     #[error("query resource limit: {0}")]
     ResourceLimit(String),
+    /// Retained data cannot answer this exact query, or its archive is not ready.
+    #[error("exact query unavailable: {0}")]
+    QueryUnavailable(String),
     #[error("insufficient disk space: available {available} bytes, required {required} bytes")]
     InsufficientDiskSpace { available: u64, required: u64 },
     #[error("query was cancelled")]

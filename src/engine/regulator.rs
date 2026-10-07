@@ -1,4 +1,4 @@
-//! Обратное давление записи по очередям, L0, памяти и задержкам чтения.
+//! Write pacing driven by read latency, memory, and compaction debt.
 
 use super::support::{duration_nanos, lock};
 use super::{
@@ -14,6 +14,10 @@ const PACING_L0: u8 = 1;
 const PACING_COMPACTION_QUEUE: u8 = 1 << 1;
 const PACING_MEMORY: u8 = 1 << 2;
 pub(super) const PACING_READ_LATENCY: u8 = 1 << 3;
+// Soft L0 pacing is charged per volume, so splitting a write into smaller
+// batches does not multiply its steady-state delay. Hard-stop checks remain
+// in the writer; memory/read-latency protection keeps its per-call floor.
+const DEBT_PACING_BYTES: u64 = 256 * 1024;
 
 #[derive(Default)]
 struct WriteRegulatorState {
@@ -47,6 +51,7 @@ pub(super) struct Regulation {
 }
 
 pub(super) struct WritePressure {
+    pub(super) incoming_bytes: u64,
     pub(super) l0_segments: usize,
     pub(super) l0_compaction_trigger: usize,
     pub(super) l0_slowdown_trigger: usize,
@@ -130,7 +135,11 @@ impl WriteRegulator {
         if pressure.l0_segments > pressure.l0_compaction_trigger {
             reasons |= PACING_L0;
         }
-        if pressure.compaction_queue_depth >= pressure.compaction_queue_capacity {
+        // Queue entries are recheck signals, not independent work items.
+        // Only amplify pressure when there is actual L0 debt to consume.
+        if pressure.l0_segments > pressure.l0_compaction_trigger
+            && pressure.compaction_queue_depth >= pressure.compaction_queue_capacity
+        {
             reasons |= PACING_COMPACTION_QUEUE;
         }
         if pressure.memory_backpressure_events > state.last_memory_backpressure_events {
@@ -167,15 +176,15 @@ impl WriteRegulator {
         state.current_reasons = reasons;
         state.active_since.get_or_insert(now);
 
-        let mut delay_ms = 0_u64;
+        let mut debt_delay_ms = 0_u64;
         if reasons & PACING_L0 != 0 {
             state.l0_events = state.l0_events.saturating_add(1);
             let debt = pressure
                 .l0_segments
                 .saturating_sub(pressure.l0_compaction_trigger);
-            delay_ms = delay_ms.saturating_add(u64::try_from(debt).unwrap_or(u64::MAX));
+            debt_delay_ms = debt_delay_ms.saturating_add(u64::try_from(debt).unwrap_or(u64::MAX));
             if pressure.l0_segments >= pressure.l0_slowdown_trigger {
-                delay_ms = delay_ms.saturating_add(
+                debt_delay_ms = debt_delay_ms.saturating_add(
                     u64::try_from(pressure.l0_segments - pressure.l0_slowdown_trigger + 1)
                         .unwrap_or(u64::MAX)
                         .saturating_mul(2),
@@ -184,12 +193,18 @@ impl WriteRegulator {
         }
         if reasons & PACING_COMPACTION_QUEUE != 0 {
             state.compaction_queue_events = state.compaction_queue_events.saturating_add(1);
-            delay_ms = delay_ms.saturating_add(
+            debt_delay_ms = debt_delay_ms.saturating_add(
                 u64::try_from(pressure.compaction_queue_depth)
                     .unwrap_or(u64::MAX)
                     .saturating_mul(2),
             );
         }
+        let debt_delay_nanos = Duration::from_millis(debt_delay_ms)
+            .as_nanos()
+            .saturating_mul(u128::from(pressure.incoming_bytes))
+            .div_ceil(u128::from(DEBT_PACING_BYTES));
+        let debt_delay = Duration::from_nanos(u64::try_from(debt_delay_nanos).unwrap_or(u64::MAX));
+        let mut delay_ms = 0_u64;
         if reasons & PACING_MEMORY != 0 {
             state.memory_events = state.memory_events.saturating_add(1);
             let percent = pressure
@@ -217,7 +232,9 @@ impl WriteRegulator {
             delay_ms = delay_ms.saturating_add(ratio.saturating_mul(ratio).clamp(1, 50));
         }
         Ok(Regulation {
-            delay: Duration::from_millis(delay_ms.max(1)).min(self.maximum_delay),
+            delay: debt_delay
+                .saturating_add(Duration::from_millis(delay_ms))
+                .min(self.maximum_delay),
         })
     }
 

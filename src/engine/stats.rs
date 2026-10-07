@@ -1,20 +1,30 @@
-//! Публичные снимки статистики и сбор показателей Storage.
+//! Public statistics snapshots and storage measurements.
 
 use super::Storage;
-use super::compaction_selection::{compaction_debt_for_state, sealed_before_for_policy};
 use super::regulator::pacing_reason_text;
 use super::support::{
     available_disk_bytes, directory_bytes, lock, micros_seconds, nanos_seconds, open_file_count,
-    read,
 };
+use crate::engine::compaction::selection::{compaction_debt, sealed_before_for_policy};
+use crate::engine::lifecycle::admission::WriteAdmissionStats;
 use crate::error::Result;
-use crate::layout::Domain;
-use crate::lifecycle::WriteAdmissionStats;
-use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::sync::atomic::Ordering;
 
-/// Снимок диагностических счётчиков.
+mod metadata;
+pub use metadata::MetadataMemoryStats;
+
+/// Lightweight background activity without scanning files, catalog, or caches.
+/// Fields are read separately and do not form an atomic transaction snapshot.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct BackgroundActivityStats {
+    pub flush_memory_bytes: u64,
+    pub compaction_memory_bytes: u64,
+    pub flushes: u64,
+    pub compactions: u64,
+}
+
+/// A snapshot of diagnostic counters.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct HistoryWatermarkStats {
     pub policy_id: u32,
@@ -22,7 +32,7 @@ pub struct HistoryWatermarkStats {
     pub sealed_before_us: i64,
 }
 
-/// Долг активного L1 на последней публикации затронутого шарда.
+/// Active L1 debt at the last publication for the affected shard.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct L1CompactionDebtStats {
     pub shard_id: u16,
@@ -35,26 +45,27 @@ pub struct L1CompactionDebtStats {
     pub overlap_components: usize,
     pub overlap_input_parts: usize,
     pub overlap_input_bytes: u64,
-    /// Число компонентов, превышающих ремонтный предел байтов.
+    /// Number of overlap components above the repair byte limit.
     pub overlap_components_over_byte_limit: usize,
-    /// Число компонентов, превышающих ремонтный предел входов.
+    /// Number of overlap components above the repair input-count limit.
     pub overlap_components_over_fan_in_limit: usize,
     pub below_consolidation_trigger: bool,
     pub no_adjacent_pack: bool,
 }
 
-/// Снимок диагностических счётчиков.
+/// A snapshot of diagnostic counters.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct StorageStats {
     pub write_admission: WriteAdmissionStats,
     pub healthy: bool,
     pub last_background_error: Option<String>,
+    /// Distinct series awaiting physical deletion and barrier collection.
+    pub pending_series_deletions: usize,
     pub visible_commit_id: u64,
     pub checkpoint_commit_id: u64,
     pub writes: u64,
     pub written_operations: u64,
     pub written_points: u64,
-    pub deleted_points: u64,
     pub wal_bytes_written: u64,
     pub wal_syncs: u64,
     pub wal_sync_seconds: f64,
@@ -73,6 +84,17 @@ pub struct StorageStats {
     pub history_watermarks: Vec<HistoryWatermarkStats>,
     pub logical_segments: usize,
     pub physical_segment_files: usize,
+    pub repack_candidate_files: u64,
+    pub repack_live_bytes: u64,
+    pub repack_reclaimable_bytes: u64,
+    pub repack_oldest_seconds: f64,
+    pub repack_jobs: u64,
+    pub repack_seconds: f64,
+    pub repack_steps: u64,
+    /// Compressed bytes copied; both physical read and write incur this amount.
+    pub repack_bytes_copied: u64,
+    pub repack_remaining_bytes: u64,
+    pub repack_canceled: u64,
     pub l0_debt: usize,
     pub flushes: u64,
     pub flush_seconds: f64,
@@ -107,7 +129,12 @@ pub struct StorageStats {
     pub sealed_compaction_max_input_bytes: u64,
     pub sealed_compaction_max_output_bytes: u64,
     pub sealed_compaction_max_fan_in: u64,
+    /// Logical L0/L1 bytes wholly behind their policy's history seal boundary.
+    /// Includes L0 fragments waiting for the history batch threshold in an open
+    /// partition; a nonzero value does not imply a runnable compaction job.
     pub sealed_compaction_debt_bytes: u64,
+    /// Time since publication of the oldest segment counted above, not time
+    /// spent in a runnable queue. Waiting below the batch threshold also ages.
     pub sealed_compaction_oldest_debt_seconds: f64,
     pub compaction_fair_handoffs: u64,
     pub active_max_rewrite_count: u32,
@@ -118,17 +145,6 @@ pub struct StorageStats {
     pub manifest_segment_descriptors: usize,
     pub manifest_archive_descriptors: usize,
     pub manifest_max_domain_descriptors: usize,
-    pub published_read_directory_generation_id: Option<u64>,
-    pub published_read_directory_generations: usize,
-    pub published_read_directory_segments: usize,
-    pub published_read_directory_pages: usize,
-    pub published_read_directory_bytes: u64,
-    pub read_directory_build_attempts: u64,
-    pub read_directory_build_resource_skips: u64,
-    pub read_directory_build_seconds: f64,
-    pub read_directory_build_max_seconds: f64,
-    pub read_directory_build_current_segments: u64,
-    pub read_directory_build_max_segments: u64,
     pub compaction_current_input_bytes: u64,
     pub publisher_phase: &'static str,
     pub shutdown_phase: &'static str,
@@ -172,9 +188,7 @@ pub struct StorageStats {
     pub query_physical_blocks_decoded: u64,
     pub query_physical_decoded_bytes: u64,
     pub query_file_opens: u64,
-    pub query_prefetched_blocks: u64,
-    pub query_prefetch_hits: u64,
-    pub query_planned_segment_reads: u64,
+    pub query_part_reads: u64,
     pub query_segment_index_lookups: u64,
     pub query_segment_index_entries_examined: u64,
     pub query_segment_index_candidates: u64,
@@ -188,8 +202,6 @@ pub struct StorageStats {
     pub recovery_seconds: f64,
     pub recovery_manifest_seconds: f64,
     pub recovery_descriptors_seconds: f64,
-    pub recovery_read_directory_pages: u64,
-    pub recovery_read_directory_bytes: u64,
     pub recovery_wal_scan_seconds: f64,
     pub recovery_wal_replay_seconds: f64,
     pub recovery_read_ready_seconds: f64,
@@ -220,6 +232,12 @@ pub struct StorageStats {
     pub membership_filter_false_positives: u64,
     pub managed_memory_max_bytes: u64,
     pub managed_memory_bytes: u64,
+    /// Combined optional metadata admission limit, including retained entries.
+    pub metadata_cache_limit_bytes: u64,
+    pub metadata_cache_reserved_bytes: u64,
+    /// Capacity protected for queue, memtable and strict-series watermarks.
+    pub write_memory_reserve_bytes: u64,
+    pub managed_non_write_bytes: u64,
     pub managed_write_queue_bytes: u64,
     pub managed_memtable_bytes: u64,
     pub managed_series_watermark_bytes: u64,
@@ -228,12 +246,15 @@ pub struct StorageStats {
     pub managed_block_cache_bytes: u64,
     pub pinned_block_cache_bytes: u64,
     pub managed_metadata_cache_bytes: u64,
+    /// Legacy remainder outside the main metadata LRU. Includes directory caches
+    /// and roots, not just reader-held objects. See `metadata_memory` for owners.
     pub pinned_metadata_cache_bytes: u64,
+    pub metadata_memory: MetadataMemoryStats,
     pub work_memory_max_bytes: u64,
     pub work_memory_bytes: u64,
     pub work_memory_peak_bytes: u64,
-    pub query_plan_memory_bytes: u64,
-    pub query_plan_peak_memory_bytes: u64,
+    pub query_sources_memory_bytes: u64,
+    pub query_sources_peak_memory_bytes: u64,
     pub query_metadata_memory_bytes: u64,
     pub query_metadata_peak_memory_bytes: u64,
     pub query_compressed_memory_bytes: u64,
@@ -254,9 +275,8 @@ pub struct StorageStats {
     pub work_memory_waits: u64,
     pub work_memory_wait_seconds: f64,
     pub memory_backpressure_events: u64,
-    /// Раздельные причины общего memory_backpressure; снимок счётчиков не атомарен.
+    /// Separate causes of memory backpressure; these counters are not an atomic snapshot.
     pub write_queue_memory_backpressure_events: u64,
-    pub read_directory_build_memory_backpressure_events: u64,
     pub read_directory_root_memory_backpressure_events: u64,
     /// Directory cache probes made only after shared managed-memory admission failed.
     pub read_directory_page_cache_global_probes: u64,
@@ -264,7 +284,9 @@ pub struct StorageStats {
     pub read_directory_page_cache_global_reclaimed_bytes: u64,
     /// Optional page insertions skipped after the bounded global search found no memory.
     pub read_directory_page_cache_global_admission_failures: u64,
-
+    /// Initial handle lookups; a miss may still reuse a concurrent opener's result.
+    /// Successful physical root opens, including a result discarded after a race.
+    /// Cache replacements; publication invalidations and explicit clears are separate.
     pub file_permit_capacity: usize,
     pub file_permits_in_use: usize,
     pub peak_file_permits_in_use: usize,
@@ -291,12 +313,188 @@ pub struct StorageStats {
     pub snapshot_pinned_segments: usize,
     pub available_disk_bytes: u64,
     pub compaction_space_rejections: u64,
+    /// Frames rejected before WAL append; these do not degrade engine health.
+    pub wal_space_rejections: u64,
     pub last_compaction_required_bytes: u64,
 }
 
+#[derive(Clone)]
+pub(super) struct FileStats {
+    pending_deletions: usize,
+    visible: u64,
+    checkpoint: u64,
+    active: u64,
+    frozen: u64,
+    l0: usize,
+    l1: usize,
+    active_l1: usize,
+    sealed_l2: usize,
+    active_max_rewrites: u32,
+    sealed_max_rewrites: u32,
+    history_watermarks: Vec<HistoryWatermarkStats>,
+    logical: usize,
+    physical: usize,
+    repack_files: u64,
+    repack_live: u64,
+    repack_dead: u64,
+    repack_oldest_seconds: f64,
+    l0_debt: usize,
+    max_domain_descriptors: usize,
+    compaction_debt: super::compaction::selection::CompactionDebt,
+    l1_compaction_debt: Vec<L1CompactionDebtStats>,
+}
+
+pub(super) fn collect_file_stats(inner: &super::Inner) -> Result<FileStats> {
+    let state = inner.state.read()?;
+    let files = state.files.clone();
+    let pending_deletions = state.deletions.entries.len();
+    let visible = state.visible_commit;
+    let checkpoint = state.checkpoint_commit;
+    let active = state.active_bytes;
+    let frozen = state.frozen.iter().map(|g| g.bytes).sum();
+    let catalog = state.catalog.clone();
+    let events = state.event_watermarks.clone();
+    let cutoffs = state.retention_cutoffs.clone();
+    drop(state);
+    let history_watermarks = events
+        .iter()
+        .filter_map(|(policy, event)| {
+            sealed_before_for_policy(&inner.options, &catalog, &events, *policy).map(
+                |sealed_before_us| HistoryWatermarkStats {
+                    policy_id: *policy,
+                    event_watermark_us: *event,
+                    sealed_before_us,
+                },
+            )
+        })
+        .collect();
+    // Full stats are explicit diagnostics. Stream summaries without retaining an inventory.
+    use crate::persistence::catalog::records::{self, DomainEntry};
+    let mut active_max_rewrites = 0;
+    let mut sealed_max_rewrites = 0;
+    let mut l0_debt = 0;
+    let mut max_domain = 0;
+    let mut l1_debt = Vec::new();
+    let mut stats_memory = inner
+        .work_memory_governor
+        .reserve_background(crate::memory::work::WorkMemoryClass::Compaction, 0)?;
+    files.visit_kind(records::DOMAIN, |key, summary: DomainEntry| {
+        l0_debt = l0_debt.max(summary.counts[0] as usize);
+        max_domain = max_domain.max(summary.count() as usize);
+        active_max_rewrites = active_max_rewrites.max(summary.max_rewrites[1]);
+        sealed_max_rewrites = sealed_max_rewrites.max(summary.max_rewrites[2]);
+        if summary.counts[1] > 0 {
+            let domain = records::domain_from_key(key)?;
+            let boundary =
+                sealed_before_for_policy(&inner.options, &catalog, &events, domain.policy_id);
+            let mut memory = inner
+                .work_memory_governor
+                .reserve_background(crate::memory::work::WorkMemoryClass::Compaction, 0)?;
+            let mut entries = Vec::new();
+            files.domain(domain, |entry| {
+                if entry.descriptor.level == 1
+                    && !boundary.is_some_and(|b| {
+                        super::compaction::selection::is_sealed_descriptor(&entry.descriptor, b)
+                    })
+                {
+                    if !memory.try_grow(2048)? {
+                        return Err(crate::Error::ResourceLimit("L1 stats memory".into()));
+                    }
+                    entries.push(entry);
+                }
+                Ok(())
+            })?;
+            if !entries.is_empty() {
+                let descriptors = entries.iter().map(|e| &e.descriptor).collect::<Vec<_>>();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let previous = super::CachedL1Debt {
+                    stats: Default::default(),
+                    oldest_eligible: None,
+                    eligible_since: entries
+                        .iter()
+                        .filter_map(|e| e.l1_eligible_since_ms.map(|at| (e.descriptor.id, at)))
+                        .collect(),
+                };
+                let debt = super::compaction::selection::l1_domain_debt(
+                    domain,
+                    &descriptors,
+                    Some(&previous),
+                    now,
+                );
+                let mut stats = debt.stats;
+                stats.oldest_eligible_seconds = debt
+                    .oldest_eligible
+                    .map_or(0.0, |ms| now.saturating_sub(ms) as f64 / 1000.0);
+                if !stats_memory.try_grow(512)? {
+                    return Err(crate::Error::ResourceLimit("L1 stats output memory".into()));
+                }
+                l1_debt.push(stats);
+            }
+        }
+        Ok(())
+    })?;
+    let debt = compaction_debt(&inner.options, &files, &catalog, &events, &cutoffs)?;
+    let totals = &files.totals;
+    Ok(FileStats {
+        pending_deletions,
+        visible,
+        checkpoint,
+        active,
+        frozen,
+        l0: totals.segments[0] as usize,
+        l1: totals.segments[1] as usize,
+        active_l1: l1_debt.iter().map(|debt| debt.parts).sum(),
+        sealed_l2: totals.segments[2] as usize,
+        active_max_rewrites,
+        sealed_max_rewrites,
+        history_watermarks,
+        logical: totals.segments.iter().sum::<u64>() as usize,
+        physical: totals.physical_files as usize,
+        repack_files: totals.repack_files,
+        repack_live: totals.repack_live_bytes,
+        repack_dead: totals.repack_dead_bytes,
+        repack_oldest_seconds: files
+            .snapshot
+            .page(records::REPACK, None, 1)?
+            .first()
+            .map_or(0.0, |row| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                now.saturating_sub(row.key.start as u64) as f64 / 1000.0
+            }),
+        l0_debt,
+        max_domain_descriptors: max_domain,
+        compaction_debt: debt,
+        l1_compaction_debt: l1_debt,
+    })
+}
+
 impl Storage {
-    /// Возвращает счётчики без удержания блокировки во время обхода каталога.
+    /// Read two counters and working-memory reservations in constant time.
+    /// Only takes the short working-memory accounting lock.
+    pub fn background_activity_stats(&self) -> Result<BackgroundActivityStats> {
+        let work = self.inner.work_memory_governor.stats()?;
+        Ok(BackgroundActivityStats {
+            flush_memory_bytes: work.flush_bytes,
+            compaction_memory_bytes: work.compaction_bytes,
+            flushes: self.inner.metrics.flushes.load(Ordering::Relaxed),
+            compactions: self.inner.metrics.compactions.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Return counters without holding a shared-state lock during catalog traversal.
     pub fn stats(&self) -> Result<StorageStats> {
+        #[cfg(feature = "publication-diagnostics")]
+        let _scope =
+            crate::diagnostics::publication::enter(self.inner.publication_diagnostics.get());
+        let _timer =
+            crate::diagnostics::publication::stage(crate::diagnostics::publication::Stage::Stats);
+
         let last_background_error = lock(&self.inner.degraded)?.clone();
         let cache = self.inner.block_cache.stats()?;
         let cache_bytes = cache.bytes;
@@ -308,8 +506,20 @@ impl Storage {
             managed_memtable_bytes,
             managed_series_watermark_bytes,
             managed_block_cache_bytes,
-            managed_metadata_cache_bytes,
+            _,
         ) = self.inner.memory_governor.stats();
+        let (
+            metadata_cache_limit_bytes,
+            metadata_cache_reserved_bytes,
+            write_memory_reserve_bytes,
+            managed_non_write_bytes,
+        ) = self.inner.memory_governor.admission_limits();
+        let metadata_memory = MetadataMemoryStats::from_usage(
+            self.inner.memory_governor.metadata_usage(),
+            metadata_cache.bytes,
+            self.inner.directory_page_pool.stats().cached_bytes,
+        );
+        let managed_metadata_cache_bytes = metadata_memory.total_bytes;
         let (
             file_permit_capacity,
             file_permits_in_use,
@@ -326,7 +536,19 @@ impl Storage {
             open_file_cache_evictions,
             uncached_file_opens,
         ) = self.inner.open_file_cache.stats()?;
-        let (
+        let _file_lock = lock(&self.inner.storage_lock)?.clone();
+        let cached = lock(&self.inner.final_file_stats)?.clone();
+        let snapshot = match cached {
+            Some(stats) => stats,
+            None if _file_lock.is_some() => collect_file_stats(&self.inner)?,
+            None => {
+                return Err(crate::error::invalid(
+                    "file statistics unavailable after failed close",
+                ));
+            }
+        };
+        let FileStats {
+            pending_deletions,
             visible,
             checkpoint,
             active,
@@ -340,131 +562,15 @@ impl Storage {
             history_watermarks,
             logical,
             physical,
+            repack_files,
+            repack_live,
+            repack_dead,
+            repack_oldest_seconds,
             l0_debt,
-            archive_descriptors,
             max_domain_descriptors,
-            published_read_directory_generation_id,
-            published_read_directory_generations,
-            published_read_directory_segments,
-            published_read_directory_pages,
-            published_read_directory_bytes,
-            published_read_directory_embedded,
             compaction_debt,
             l1_compaction_debt,
-        ) = {
-            let state = read(&self.inner.state)?;
-            let mut l0_domains = BTreeMap::<Domain, usize>::new();
-            let mut active_l1 = 0_usize;
-            let mut sealed_l2 = 0_usize;
-            let mut active_max_rewrites = 0_u32;
-            let mut sealed_max_rewrites = 0_u32;
-            let history_watermarks = state
-                .event_watermarks
-                .iter()
-                .filter_map(|(policy_id, event_watermark_us)| {
-                    sealed_before_for_policy(
-                        &self.inner.options,
-                        &state.catalog,
-                        &state.event_watermarks,
-                        *policy_id,
-                    )
-                    .map(|sealed_before_us| HistoryWatermarkStats {
-                        policy_id: *policy_id,
-                        event_watermark_us: *event_watermark_us,
-                        sealed_before_us,
-                    })
-                })
-                .collect::<Vec<_>>();
-            for segment in &state.segments {
-                let descriptor = segment.descriptor();
-                if descriptor.level == 0 {
-                    *l0_domains.entry(descriptor.domain()).or_default() += 1;
-                } else if descriptor.level == 1 {
-                    active_l1 = active_l1.saturating_add(1);
-                    active_max_rewrites = active_max_rewrites.max(descriptor.rewrite_count);
-                } else if descriptor.level == 2 {
-                    sealed_l2 = sealed_l2.saturating_add(1);
-                    sealed_max_rewrites = sealed_max_rewrites.max(descriptor.rewrite_count);
-                }
-            }
-            (
-                state.visible_commit,
-                state.checkpoint_commit,
-                state.active_bytes,
-                state.frozen.iter().map(|generation| generation.bytes).sum(),
-                state
-                    .segments
-                    .iter()
-                    .filter(|segment| segment.descriptor().level == 0)
-                    .count(),
-                state
-                    .segments
-                    .iter()
-                    .filter(|segment| segment.descriptor().level == 1)
-                    .count(),
-                active_l1,
-                sealed_l2,
-                active_max_rewrites,
-                sealed_max_rewrites,
-                history_watermarks,
-                state.segments.len(),
-                state
-                    .segments
-                    .iter()
-                    .map(|segment| segment.path())
-                    .collect::<HashSet<_>>()
-                    .len(),
-                l0_domains.values().copied().max().unwrap_or(0),
-                state.aggregate_archives.len(),
-                state
-                    .segments
-                    .iter()
-                    .fold(BTreeMap::<Domain, usize>::new(), |mut counts, segment| {
-                        *counts.entry(segment.descriptor().domain()).or_default() += 1;
-                        counts
-                    })
-                    .into_values()
-                    .max()
-                    .unwrap_or(0),
-                state
-                    .published_read_directories
-                    .iter()
-                    .map(|directory| directory.generation_id())
-                    .max(),
-                state.published_read_directories.len(),
-                state
-                    .published_read_directories
-                    .iter()
-                    .map(|directory| directory.covered_segment_count())
-                    .sum(),
-                state
-                    .published_read_directories
-                    .iter()
-                    .map(|directory| directory.root_pages())
-                    .sum(),
-                state
-                    .published_read_directories
-                    .iter()
-                    .map(|directory| directory.artifact_bytes())
-                    .sum(),
-                state
-                    .published_read_directories
-                    .iter()
-                    .all(|directory| directory.has_embedded_descriptors()),
-                compaction_debt_for_state(&self.inner.options, &state),
-                state
-                    .l1_debt
-                    .values()
-                    .map(|debt| {
-                        let mut stats = debt.stats.clone();
-                        stats.oldest_eligible_seconds = debt
-                            .oldest_eligible
-                            .map_or(0.0, |at| at.elapsed().as_secs_f64());
-                        stats
-                    })
-                    .collect(),
-            )
-        };
+        } = snapshot;
         let manifest_bytes = fs::metadata(self.inner.root.join("manifest/MANIFEST.json"))
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -486,6 +592,7 @@ impl Storage {
             write_admission: self.inner.admission.stats(),
             healthy: last_background_error.is_none(),
             last_background_error,
+            pending_series_deletions: pending_deletions,
             visible_commit_id: visible,
             checkpoint_commit_id: checkpoint,
             writes: self.inner.metrics.writes.load(Ordering::Relaxed),
@@ -495,7 +602,6 @@ impl Storage {
                 .written_operations
                 .load(Ordering::Relaxed),
             written_points: self.inner.metrics.written_points.load(Ordering::Relaxed),
-            deleted_points: self.inner.metrics.deleted_points.load(Ordering::Relaxed),
             wal_bytes_written: self.inner.metrics.wal_bytes.load(Ordering::Relaxed),
             wal_syncs: self.inner.metrics.wal_syncs.load(Ordering::Relaxed),
             wal_sync_seconds: nanos_seconds(
@@ -536,6 +642,24 @@ impl Storage {
             history_watermarks,
             logical_segments: logical,
             physical_segment_files: physical,
+            repack_candidate_files: repack_files,
+            repack_live_bytes: repack_live,
+            repack_reclaimable_bytes: repack_dead,
+            repack_oldest_seconds,
+            repack_jobs: self.inner.metrics.repack_jobs.load(Ordering::Relaxed),
+            repack_seconds: self.inner.metrics.repack_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+            repack_steps: self.inner.metrics.repack_steps.load(Ordering::Relaxed),
+            repack_bytes_copied: self
+                .inner
+                .metrics
+                .repack_bytes_copied
+                .load(Ordering::Relaxed),
+            repack_remaining_bytes: self
+                .inner
+                .metrics
+                .repack_remaining_bytes
+                .load(Ordering::Relaxed),
+            repack_canceled: self.inner.metrics.repack_canceled.load(Ordering::Relaxed),
             l0_debt,
             flushes: self.inner.metrics.flushes.load(Ordering::Relaxed),
             flush_seconds: nanos_seconds(self.inner.metrics.flush_nanos.load(Ordering::Relaxed)),
@@ -687,51 +811,12 @@ impl Storage {
             active_max_rewrite_count: active_max_rewrites,
             sealed_max_rewrite_count: sealed_max_rewrites,
             manifest_bytes,
-            manifest_limit_bytes: crate::manifest::MANIFEST_MAX_BYTES,
-            manifest_headroom_bytes: crate::manifest::MANIFEST_MAX_BYTES
+            manifest_limit_bytes: crate::persistence::manifest::MANIFEST_MAX_BYTES,
+            manifest_headroom_bytes: crate::persistence::manifest::MANIFEST_MAX_BYTES
                 .saturating_sub(manifest_bytes),
-            manifest_segment_descriptors: logical.saturating_sub(
-                published_read_directory_segments * usize::from(published_read_directory_embedded),
-            ),
-            manifest_archive_descriptors: archive_descriptors,
+            manifest_segment_descriptors: 0,
+            manifest_archive_descriptors: 0,
             manifest_max_domain_descriptors: max_domain_descriptors,
-            published_read_directory_generation_id,
-            published_read_directory_generations,
-            published_read_directory_segments,
-            published_read_directory_pages,
-            published_read_directory_bytes,
-            read_directory_build_attempts: self
-                .inner
-                .metrics
-                .read_directory_build_attempts
-                .load(Ordering::Relaxed),
-            read_directory_build_resource_skips: self
-                .inner
-                .metrics
-                .read_directory_build_resource_skips
-                .load(Ordering::Relaxed),
-            read_directory_build_seconds: nanos_seconds(
-                self.inner
-                    .metrics
-                    .read_directory_build_nanos
-                    .load(Ordering::Relaxed),
-            ),
-            read_directory_build_max_seconds: nanos_seconds(
-                self.inner
-                    .metrics
-                    .read_directory_build_max_nanos
-                    .load(Ordering::Relaxed),
-            ),
-            read_directory_build_current_segments: self
-                .inner
-                .metrics
-                .read_directory_build_current_segments
-                .load(Ordering::Relaxed),
-            read_directory_build_max_segments: self
-                .inner
-                .metrics
-                .read_directory_build_max_segments
-                .load(Ordering::Relaxed),
             compaction_current_input_bytes: self
                 .inner
                 .metrics
@@ -740,7 +825,7 @@ impl Storage {
             publisher_phase: match self.inner.metrics.publisher_phase.load(Ordering::Relaxed) {
                 1 => "flush",
                 2 => "compaction",
-                3 => "read_directory",
+                3 => "collect_files",
                 4 => "checkpoint",
                 5 => "catalog",
                 6 => "snapshot",
@@ -900,21 +985,7 @@ impl Storage {
                 .query_physical_decoded_bytes
                 .load(Ordering::Relaxed),
             query_file_opens: self.inner.metrics.query_file_opens.load(Ordering::Relaxed),
-            query_prefetched_blocks: self
-                .inner
-                .metrics
-                .query_prefetched_blocks
-                .load(Ordering::Relaxed),
-            query_prefetch_hits: self
-                .inner
-                .metrics
-                .query_prefetch_hits
-                .load(Ordering::Relaxed),
-            query_planned_segment_reads: self
-                .inner
-                .metrics
-                .query_planned_segment_reads
-                .load(Ordering::Relaxed),
+            query_part_reads: self.inner.metrics.query_part_reads.load(Ordering::Relaxed),
             query_segment_index_lookups: self
                 .inner
                 .metrics
@@ -973,16 +1044,6 @@ impl Storage {
                     .recovery_descriptors_nanos
                     .load(Ordering::Relaxed),
             ),
-            recovery_read_directory_pages: self
-                .inner
-                .metrics
-                .recovery_read_directory_pages
-                .load(Ordering::Relaxed),
-            recovery_read_directory_bytes: self
-                .inner
-                .metrics
-                .recovery_read_directory_bytes
-                .load(Ordering::Relaxed),
             recovery_wal_scan_seconds: nanos_seconds(
                 self.inner
                     .metrics
@@ -1033,6 +1094,10 @@ impl Storage {
             membership_filter_false_positives: metadata_cache.membership_false_positives,
             managed_memory_max_bytes,
             managed_memory_bytes,
+            metadata_cache_limit_bytes,
+            metadata_cache_reserved_bytes,
+            write_memory_reserve_bytes,
+            managed_non_write_bytes,
             managed_write_queue_bytes,
             managed_memtable_bytes,
             managed_series_watermark_bytes,
@@ -1048,11 +1113,12 @@ impl Storage {
             pinned_block_cache_bytes,
             managed_metadata_cache_bytes,
             pinned_metadata_cache_bytes,
+            metadata_memory,
             work_memory_max_bytes: work_memory.maximum_bytes,
             work_memory_bytes: work_memory.used_bytes,
             work_memory_peak_bytes: work_memory.peak_bytes,
-            query_plan_memory_bytes: work_memory.query_plan_bytes,
-            query_plan_peak_memory_bytes: work_memory.query_plan_peak_bytes,
+            query_sources_memory_bytes: work_memory.query_sources_bytes,
+            query_sources_peak_memory_bytes: work_memory.query_sources_peak_bytes,
             query_metadata_memory_bytes: work_memory.query_metadata_bytes,
             query_metadata_peak_memory_bytes: work_memory.query_metadata_peak_bytes,
             query_compressed_memory_bytes: work_memory.query_compressed_bytes,
@@ -1081,11 +1147,6 @@ impl Storage {
                 .inner
                 .metrics
                 .write_queue_memory_backpressure
-                .load(Ordering::Relaxed),
-            read_directory_build_memory_backpressure_events: self
-                .inner
-                .metrics
-                .read_directory_build_memory_backpressure
                 .load(Ordering::Relaxed),
             read_directory_root_memory_backpressure_events: self
                 .inner
@@ -1134,6 +1195,11 @@ impl Storage {
             snapshot_pinned_memtable_generations,
             snapshot_pinned_segments,
             available_disk_bytes: available_disk_bytes(&self.inner.root)?,
+            wal_space_rejections: self
+                .inner
+                .metrics
+                .wal_space_rejections
+                .load(Ordering::Relaxed),
             compaction_space_rejections: self
                 .inner
                 .metrics

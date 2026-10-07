@@ -1,9 +1,9 @@
-//! Кодирование временных отметок и значений блоков.
+//! Block timestamp and value encoding.
 
 use crate::catalog::TimestampCodec;
 use crate::error::{Result, invalid};
+use crate::persistence::wal::{put_i64, put_u64};
 use crate::types::VersionedPoint;
-use crate::wal::{put_i64, put_u64};
 
 pub(super) fn encode_timestamps(
     operations: &[VersionedPoint],
@@ -51,23 +51,16 @@ pub(super) fn encode_timestamps(
 }
 
 pub(super) fn encode_raw_values(operations: &[VersionedPoint]) -> Vec<u8> {
-    let put_count = operations
-        .iter()
-        .filter(|operation| !operation.is_delete)
-        .count();
+    let put_count = operations.len();
     let mut result = vec![0_u8; put_count * 8];
-    for (position, point) in operations
-        .iter()
-        .filter(|operation| !operation.is_delete)
-        .enumerate()
-    {
+    for (position, point) in operations.iter().enumerate() {
         put_u64(&mut result, position * 8, point.value_bits);
     }
     result
 }
 
 pub(super) fn encode_gorilla_values(operations: &[VersionedPoint]) -> Vec<u8> {
-    let mut puts = operations.iter().filter(|operation| !operation.is_delete);
+    let mut puts = operations.iter();
     let Some(first) = puts.next() else {
         return Vec::new();
     };

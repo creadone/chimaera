@@ -1,4 +1,4 @@
-//! Формат индекса: кодирование, декодирование и проверка границ блоков.
+//! Index encoding, decoding, and block-boundary validation.
 
 use super::{
     BLOCK_HEADER_SIZE, BLOCK_MAGIC, BlockIndex, CountSumSummary, FOOTER_MAGIC, FOOTER_SIZE,
@@ -11,8 +11,10 @@ use super::{
 };
 use crate::aggregate;
 use crate::error::{Result, corrupt, invalid};
+use crate::persistence::wal::{
+    put_i64, put_u16, put_u32, put_u64, read_i64, read_u16, read_u32, read_u64,
+};
 use crate::types::SeriesKey;
-use crate::wal::{put_i64, put_u16, put_u32, put_u64, read_i64, read_u16, read_u32, read_u64};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::Path;
@@ -169,7 +171,9 @@ pub(super) fn decode_legacy_index(bytes: &[u8], data_end: u64) -> Result<Vec<Blo
         if current.offset < previous_end
             || current.size < BLOCK_HEADER_SIZE as u32
             || current.size as usize
-                > BLOCK_HEADER_SIZE + crate::v1::MAX_BLOCK_BYTES + MAX_STORED_BLOCK_OVERHEAD
+                > BLOCK_HEADER_SIZE
+                    + crate::persistence::decode::MAX_BLOCK_BYTES
+                    + MAX_STORED_BLOCK_OVERHEAD
             || end > data_end
             || current.min_timestamp_us > current.max_timestamp_us
             || previous_series.is_some_and(|series| series > current.series)
@@ -206,9 +210,7 @@ pub(super) fn decode_paged_index(bytes: &[u8], data_end: u64) -> Result<Vec<Bloc
             return Err(corrupt("paged segment index page CRC32C mismatch"));
         }
         let decoded = decode_index_page(page_bytes, data_end)?;
-        if decoded.len() != page.block_count as usize
-            || decoded.first().map(|entry| entry.series) != Some(page.first_series)
-            || decoded.last().map(|entry| entry.series) != Some(page.last_series)
+        if !page.matches_blocks(&decoded)
             || decoded
                 .iter()
                 .any(|entry| !root.membership.contains(entry.series))
@@ -234,6 +236,7 @@ pub(super) fn paged_index_root_layout(
         || &header[..8] != PAGED_INDEX_MAGIC
         || read_u16(header, 8) != 3
         || read_u16(header, 10) as usize != INDEX_PAGE_DIRECTORY_SIZE
+        || read_u32(header, 32) != crc32c::crc32c(&header[..32])
     {
         return Err(corrupt("invalid paged segment index header"));
     }
@@ -268,8 +271,12 @@ pub(super) fn paged_index_root_layout(
 }
 
 pub(super) fn decode_index_page_descriptor(entry: &[u8]) -> Result<IndexPageDescriptor> {
-    if entry.len() != INDEX_PAGE_DIRECTORY_SIZE || read_u32(entry, 52) != 0 {
+    if entry.len() != INDEX_PAGE_DIRECTORY_SIZE {
         return Err(corrupt("invalid paged segment index directory"));
+    }
+    let checksum = crc32c::crc32c_append(crc32c::crc32c(&entry[..52]), &entry[56..]);
+    if read_u32(entry, 52) != checksum {
+        return Err(corrupt("segment index descriptor checksum mismatch"));
     }
     Ok(IndexPageDescriptor {
         first_series: SeriesKey::new(read_u32(entry, 0), read_u32(entry, 4), read_u64(entry, 8)),
@@ -282,16 +289,20 @@ pub(super) fn decode_index_page_descriptor(entry: &[u8]) -> Result<IndexPageDesc
         length: read_u32(entry, 40),
         block_count: read_u32(entry, 44),
         crc32c: read_u32(entry, 48),
+
+        first_timestamp: read_i64(entry, 56),
+
+        last_timestamp: read_i64(entry, 64),
     })
 }
 
 pub(super) fn validate_index_page_descriptor(
     descriptor: IndexPageDescriptor,
-    previous_last: Option<SeriesKey>,
+    previous_last: Option<(SeriesKey, i64)>,
     expected_offset: u64,
 ) -> Result<()> {
-    if descriptor.first_series > descriptor.last_series
-        || previous_last.is_some_and(|previous| previous >= descriptor.first_series)
+    if descriptor.first_key() > descriptor.last_key()
+        || previous_last.is_some_and(|previous| previous >= descriptor.first_key())
         || descriptor.offset != expected_offset
         || descriptor.length < INDEX_PAGE_HEADER_SIZE as u32 + INDEX_ENTRY_SIZE as u32
         || descriptor.block_count == 0
@@ -335,7 +346,7 @@ pub(super) fn decode_paged_index_root(bytes: &[u8]) -> Result<(PagedIndexRoot, u
             .checked_add(u64::from(descriptor.length))
             .ok_or_else(|| corrupt("paged segment index page end overflow"))?;
         counted_blocks = counted_blocks.saturating_add(u64::from(descriptor.block_count));
-        previous_last = Some(descriptor.last_series);
+        previous_last = Some(descriptor.last_key());
         pages.push(descriptor);
     }
     if counted_blocks != u64::from(block_count) {
@@ -414,23 +425,29 @@ pub(super) fn validate_index_entries(
 ) -> Result<Vec<BlockIndex>> {
     let mut previous_end = HEADER_SIZE as u64;
     let mut previous_series = None;
+    let mut previous_timestamp = i64::MIN;
     for current in &index {
         let end = current.offset.saturating_add(u64::from(current.size));
         if current.offset < previous_end
             || current.size < BLOCK_HEADER_SIZE as u32
             || current.size as usize
-                > BLOCK_HEADER_SIZE + crate::v1::MAX_BLOCK_BYTES + MAX_STORED_BLOCK_OVERHEAD
+                > BLOCK_HEADER_SIZE
+                    + crate::persistence::decode::MAX_BLOCK_BYTES
+                    + MAX_STORED_BLOCK_OVERHEAD
             || end > data_end
             || current.min_timestamp_us > current.max_timestamp_us
             || current
                 .count_sum
                 .is_some_and(|summary| read_count_sum_summary(summary).is_err())
             || previous_series.is_some_and(|series| series > current.series)
+            || (previous_series == Some(current.series)
+                && previous_timestamp >= current.min_timestamp_us)
         {
             return Err(corrupt("invalid Chimaera segment index entry"));
         }
         previous_end = end;
         previous_series = Some(current.series);
+        previous_timestamp = current.max_timestamp_us;
     }
     Ok(index)
 }
@@ -450,13 +467,11 @@ pub(super) fn validate_block_headers(
         let mut header = [0_u8; BLOCK_HEADER_SIZE];
         file.read_exact(&mut header)?;
         let record_count = read_u32(&header, 56);
-        let put_count = read_u32(&header, 60);
-        let delete_count = read_u32(&header, 64);
         let block_min_commit = read_u64(&header, 40);
         let block_max_commit = read_u64(&header, 48);
         if &header[..4] != BLOCK_MAGIC
             || read_u16(&header, 4) as usize != BLOCK_HEADER_SIZE
-            || header[6] != 1
+            || header[6] != crate::persistence::decode::BLOCK_FORMAT
             || header[7] != 0
             || SeriesKey::new(
                 read_u32(&header, 8),
@@ -467,7 +482,7 @@ pub(super) fn validate_block_headers(
             || read_i64(&header, 32) != entry.max_timestamp_us
             || block_min_commit > block_max_commit
             || record_count == 0
-            || put_count.saturating_add(delete_count) != record_count
+            || read_u64(&header, 60) != 0
             || read_u32(&header, 76).saturating_add(BLOCK_HEADER_SIZE as u32) != entry.size
             || read_u32(&header, 84) != crc32c::crc32c(&header[..84])
         {
@@ -564,6 +579,10 @@ pub(super) fn encode_index(index: &[BlockIndex]) -> Result<Vec<u8>> {
     }
     let membership_crc = crc32c::crc32c(&bytes[PAGED_INDEX_HEADER_SIZE..directory_offset]);
     put_u32(&mut bytes, 28, membership_crc);
+    {
+        let header_crc = crc32c::crc32c(&bytes[..32]);
+        put_u32(&mut bytes, 32, header_crc);
+    }
     let mut page_offset = root_length;
     for (page_number, range) in ranges.iter().enumerate() {
         let page_length = INDEX_PAGE_HEADER_SIZE + (range.end - range.start) * INDEX_ENTRY_SIZE;
@@ -612,30 +631,24 @@ pub(super) fn encode_index(index: &[BlockIndex]) -> Result<Vec<u8>> {
                 .map_err(|_| invalid("too many blocks in an index page"))?,
         );
         put_u32(directory, 48, page_crc);
+
+        {
+            put_i64(directory, 56, index[range.start].min_timestamp_us);
+            put_i64(directory, 64, index[range.end - 1].max_timestamp_us);
+            let checksum =
+                crc32c::crc32c_append(crc32c::crc32c(&directory[..52]), &directory[56..]);
+            put_u32(directory, 52, checksum);
+        }
         page_offset += page_length;
     }
     Ok(bytes)
 }
 
 pub(super) fn index_page_ranges(index: &[BlockIndex]) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut start = 0_usize;
-    let mut position = 0_usize;
-    while position < index.len() {
-        let series = index[position].series;
-        let series_start = position;
-        while position < index.len() && index[position].series == series {
-            position += 1;
-        }
-        if series_start > start && position - start > TARGET_INDEX_PAGE_BLOCKS {
-            ranges.push(start..series_start);
-            start = series_start;
-        }
-    }
-    if start < index.len() {
-        ranges.push(start..index.len());
-    }
-    ranges
+    (0..index.len())
+        .step_by(TARGET_INDEX_PAGE_BLOCKS)
+        .map(|start| start..(start + TARGET_INDEX_PAGE_BLOCKS).min(index.len()))
+        .collect()
 }
 
 pub(super) fn encode_index_entry(bytes: &mut [u8], entry: BlockIndex) {

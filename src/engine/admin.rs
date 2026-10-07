@@ -1,56 +1,59 @@
-//! Проверка, checkpoint, flush и явная компакция Storage.
+//! Storage verification, checkpoint, flush, and explicit compaction.
 
 use super::options::CompactionOptions;
 use super::{CompactionCommand, Storage, WriteCommand};
+use crate::engine::lifecycle::admission::{DEFAULT_WAIT_TIMEOUT, OverloadReason};
 use crate::error::Result;
-use crate::lifecycle::OverloadReason;
 use crossbeam_channel::bounded;
 use std::path::Path;
+use std::time::Instant;
 
 impl Storage {
-    /// Читает опубликованные метаданные базы без `LOCK`, WAL writer или изменения файлов.
+    /// Read metadata under a shared directory lock without modifying files.
+    /// Publication and file deletion wait for this diagnostic operation to finish.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку отсутствующего либо повреждённого IDENTITY/manifest или I/O.
-    pub fn info(path: impl AsRef<Path>) -> Result<crate::diagnostics::StorageInfo> {
-        crate::diagnostics::storage_info(path.as_ref())
+    /// Returns missing or corrupt IDENTITY/manifest errors, or I/O errors.
+    pub fn info(path: impl AsRef<Path>) -> Result<crate::admin::verify::StorageInfo> {
+        crate::admin::verify::storage_info(path.as_ref())
     }
 
-    /// Полностью проверяет segment payload и WAL без открытия базы на запись.
+    /// Fully verify segment payloads and WAL without opening the database for writes.
     #[must_use]
-    pub fn verify(path: impl AsRef<Path>) -> crate::diagnostics::VerificationReport {
-        crate::diagnostics::verify_storage(path.as_ref())
+    pub fn verify(path: impl AsRef<Path>) -> crate::admin::verify::VerificationReport {
+        crate::admin::verify::verify_storage(path.as_ref())
     }
     #[must_use]
     pub fn verify_with_options(
         path: impl AsRef<Path>,
-        options: crate::diagnostics::VerificationOptions,
-    ) -> crate::diagnostics::VerificationReport {
-        crate::diagnostics::verify_storage_with_options(path.as_ref(), options)
+        options: crate::admin::verify::VerificationOptions,
+    ) -> crate::admin::verify::VerificationReport {
+        crate::admin::verify::verify_storage_with_options(path.as_ref(), options)
     }
 
-    /// Восстанавливает проверяемую базу и допустимый хвост WAL в новый каталог.
+    /// Recover a verifiable database and a permitted partial WAL tail into a new directory.
     ///
-    /// Исходный каталог открывается только на чтение; результат публикуется после
-    /// штатного recovery/checkpoint и повторной полной verify.
+    /// The source is read-only; the result is published after normal recovery,
+    /// checkpoint, and another full verification.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку повреждения вне допустимого хвоста, существующего назначения
-    /// либо файлового I/O.
+    /// Returns an error for corruption outside the permitted tail, an existing destination,
+    /// or filesystem I/O failure.
     pub fn salvage(
         source: impl AsRef<Path>,
         destination: impl AsRef<Path>,
-    ) -> Result<crate::diagnostics::SalvageResult> {
-        crate::diagnostics::salvage_storage(source.as_ref(), destination.as_ref())
+    ) -> Result<crate::admin::verify::SalvageResult> {
+        crate::admin::verify::salvage_storage(source.as_ref(), destination.as_ref())
     }
 
-    /// Сбрасывает все записи до текущего commit ID и публикует checkpoint.
+    /// Flush the accepted write prefix and publish a checkpoint.
+    /// Returns the checkpoint commit ID, not a point or byte count.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку фонового работника или файловой системы.
+    /// Returns background-worker or filesystem errors.
     pub fn checkpoint(&self) -> Result<u64> {
         self.ensure_writable()?;
         let (reply, receiver) = bounded(1);
@@ -63,11 +66,12 @@ impl Storage {
         )
     }
 
-    /// Сбрасывает текущую memtable в L0, сохраняя покрытый WAL до checkpoint.
+    /// Flush the current memtable to L0, retaining covered WAL until checkpoint.
+    /// Returns the flushed barrier's commit ID.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку writer, flush worker или атомарной публикации сегментов.
+    /// Returns writer, flush-worker, or atomic segment-publication errors.
     pub fn flush(&self) -> Result<u64> {
         self.ensure_writable()?;
         let (reply_tx, reply_rx) = bounded(1);
@@ -80,24 +84,38 @@ impl Storage {
         )
     }
 
-    /// Полностью обслуживает активные L0/L1, затем исторические L0/L2.
+    /// Run full maintenance of active L0/L1, then historical L0/L2.
+    /// Returns the greatest segment/archive ID reported by active/history compaction,
+    /// or zero if neither reported an output ID. Cleanup/repack output IDs are excluded.
+    /// This is not a commit ID or a debt count.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку чтения, записи или атомарной публикации.
+    /// Returns read, write, or atomic publication errors.
     pub fn compact(&self) -> Result<u64> {
         self.compact_with_options(CompactionOptions::default())
     }
 
-    /// Запускает полный либо пороговый проход слияния опубликованных L0.
+    /// Run a full or threshold-driven compaction pass over published inputs.
     ///
     /// # Errors
     ///
-    /// Возвращает ошибку чтения, записи или атомарной публикации.
+    /// Returns read, write, or atomic publication errors.
     pub fn compact_with_options(&self, options: CompactionOptions) -> Result<u64> {
+        self.compact_until(options, Instant::now() + DEFAULT_WAIT_TIMEOUT)
+    }
+
+    /// Wait for one compaction pass and then watermark pruning, using one deadline.
+    /// An accepted operation continues after the wait expires.
+    ///
+    /// # Errors
+    /// Each phase can return `Overloaded` before its admission or `OperationPending`
+    /// after admission. A pruning-admission error can follow a completed compaction.
+    /// Also returns compaction, watermark-pruning, and storage errors.
+    pub fn compact_until(&self, options: CompactionOptions, deadline: Instant) -> Result<u64> {
         self.ensure_writable()?;
         let (reply_tx, reply_rx) = bounded(1);
-        self.request_command(
+        let compacted = self.request_command_until(
             &self.inner.compaction_tx,
             CompactionCommand::Trigger {
                 force: options.full,
@@ -106,6 +124,17 @@ impl Storage {
             &reply_rx,
             OverloadReason::CompactionDebt,
             "compact",
-        )
+            deadline,
+        )?;
+        let (reply_tx, reply_rx) = bounded(1);
+        self.request_command_until(
+            &self.inner.write_tx,
+            super::WriteCommand::PruneWatermarks { reply: reply_tx },
+            &reply_rx,
+            OverloadReason::CompactionDebt,
+            "compact watermark cleanup",
+            deadline,
+        )?;
+        Ok(compacted)
     }
 }

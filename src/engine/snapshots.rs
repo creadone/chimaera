@@ -1,10 +1,40 @@
-//! Учёт времени жизни и ресурсов MVCC-снимков.
+//! Read snapshots, retained files, and resource ownership.
 
 use super::support::lock;
 use crate::error::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+impl super::Snapshot {
+    pub(super) fn read_directory(
+        &self,
+        descriptor: &crate::segment::SegmentDescriptor,
+    ) -> Option<crate::segment::ReadDirectory> {
+        self.offline_pack_directory
+            .as_ref()
+            .filter(|directory| directory.covers_segment(descriptor))
+            .cloned()
+    }
+
+    // A terminal stream may remain in client code for its final statistics.
+    // Release every source before unregistering the snapshot or its memory.
+    pub(super) fn release(&mut self) {
+        self.deletions = Default::default();
+        self.batches = Vec::new();
+        self.segments_by_shard = Default::default();
+        self.retention_cutoffs = Default::default();
+        self.aggregate_retention_cutoffs = Default::default();
+        self.retained_aggregate_resolutions = Default::default();
+        self.series_policy_ids = Default::default();
+        self.aggregate_archives = Vec::new();
+        self.offline_pack_directory = None;
+        self.file_view = None;
+        self.guard = None;
+        self.storage_lock = None;
+        self.memory = None;
+    }
+}
 
 struct ActiveSnapshot {
     started: Instant,

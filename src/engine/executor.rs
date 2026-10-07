@@ -1,114 +1,18 @@
-//! Ограниченный пул планирования и исполнения многорядных запросов.
+//! Bounded executor for multi-series queries.
 
-use super::group_cursor::SeriesCursor;
 use super::snapshots::SnapshotGuard;
-use super::{MAX_QUERY_WORKERS, QUERY_WORK_WAIT, Snapshot};
+use super::{QUERY_WORK_WAIT, Snapshot};
+use crate::engine::group::cursor::SeriesCursor;
+use crate::engine::lifecycle::admission::OverloadReason;
 use crate::error::{Error, Result};
-use crate::lifecycle::OverloadReason;
-use crate::query::{ExecutorTaskKind, QueryBudget, QueryMemoryClass};
-use crate::segment::{OfflinePackDirectory, QueryPlanReservation, QuerySegmentRead, Segment};
-use crate::storage_lock::StorageLock;
-use crate::types::{GroupRow, SeriesKey};
-use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
+use crate::persistence::lock::StorageLock;
+use crate::query::{QueryBudget, QueryMemoryClass};
+use crate::types::GroupRow;
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Instant;
-
-pub(super) struct QueryPlanningResult {
-    pub(super) planned: Vec<(SeriesKey, QuerySegmentRead)>,
-    pub(super) reservation: QueryPlanReservation,
-    pub(super) descriptors_examined: u64,
-    pub(super) series_index_lookups: u64,
-}
-
-pub(super) enum QueryPlanningTask {
-    #[cfg(test)]
-    Probe(Box<dyn FnOnce() -> Result<()> + Send>),
-    Directory {
-        directory: Arc<OfflinePackDirectory>,
-        series_ranges: Vec<(SeriesKey, i64)>,
-        to_us: i64,
-    },
-    Segments {
-        segments: Vec<Arc<Segment>>,
-        series_ranges: Vec<(SeriesKey, i64)>,
-        from_us: i64,
-        to_us: i64,
-        commit_id: u64,
-    },
-}
-
-impl QueryPlanningTask {
-    pub(super) fn run(self, query_budget: &Arc<QueryBudget>) -> Result<QueryPlanningResult> {
-        let mut reservation = QueryPlanReservation::new(Arc::clone(query_budget));
-        match self {
-            #[cfg(test)]
-            Self::Probe(run) => {
-                run()?;
-                Ok(QueryPlanningResult {
-                    planned: Vec::new(),
-                    reservation,
-                    descriptors_examined: 0,
-                    series_index_lookups: 0,
-                })
-            }
-            Self::Directory {
-                directory,
-                series_ranges,
-                to_us,
-            } => {
-                let series_index_lookups = u64::try_from(series_ranges.len()).unwrap_or(u64::MAX);
-                let planned = directory.plan_query_series(
-                    &series_ranges,
-                    to_us,
-                    query_budget,
-                    &mut reservation,
-                )?;
-                Ok(QueryPlanningResult {
-                    planned,
-                    reservation,
-                    descriptors_examined: 0,
-                    series_index_lookups,
-                })
-            }
-            Self::Segments {
-                segments,
-                series_ranges,
-                from_us,
-                to_us,
-                commit_id,
-            } => {
-                let mut planned = Vec::new();
-                let mut descriptors_examined = 0_u64;
-                let mut series_index_lookups = 0_u64;
-                for segment in segments {
-                    descriptors_examined = descriptors_examined.saturating_add(1);
-                    if segment.descriptor().min_commit > commit_id
-                        || segment.descriptor().max_timestamp_us < from_us
-                        || segment.descriptor().min_timestamp_us >= to_us
-                    {
-                        continue;
-                    }
-                    series_index_lookups = series_index_lookups
-                        .saturating_add(u64::try_from(series_ranges.len()).unwrap_or(u64::MAX));
-                    planned.extend(segment.plan_query_series(
-                        &series_ranges,
-                        to_us,
-                        query_budget,
-                        &mut reservation,
-                    )?);
-                }
-                Ok(QueryPlanningResult {
-                    planned,
-                    reservation,
-                    descriptors_examined,
-                    series_index_lookups,
-                })
-            }
-        }
-    }
-}
 
 #[derive(Clone)]
 pub(super) struct QueryLease {
@@ -126,11 +30,6 @@ impl Snapshot {
 }
 
 pub(super) enum QueryWork {
-    #[cfg(test)]
-    Pause {
-        entered: Sender<()>,
-        release: Receiver<()>,
-    },
     Series {
         lease: QueryLease,
         index: usize,
@@ -138,14 +37,6 @@ pub(super) enum QueryWork {
         enqueued_at: Instant,
         query_budget: Arc<QueryBudget>,
         reply: Sender<(usize, Result<Vec<GroupRow>>)>,
-    },
-    Planning {
-        lease: QueryLease,
-        index: usize,
-        task: QueryPlanningTask,
-        enqueued_at: Instant,
-        query_budget: Arc<QueryBudget>,
-        reply: Sender<(usize, Result<QueryPlanningResult>)>,
     },
 }
 
@@ -156,10 +47,7 @@ pub(super) struct QueryExecutor {
 }
 
 impl QueryExecutor {
-    pub(super) fn new() -> Result<Arc<Self>> {
-        let worker_count = thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .min(MAX_QUERY_WORKERS);
+    pub(super) fn new(worker_count: usize) -> Result<Arc<Self>> {
         let (sender, receiver) = bounded(worker_count.saturating_mul(2).max(1));
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
@@ -179,84 +67,6 @@ impl QueryExecutor {
 
     pub(super) fn is_parallel(&self) -> bool {
         self.worker_count > 1
-    }
-
-    pub(super) fn plan(
-        &self,
-        tasks: Vec<QueryPlanningTask>,
-        lease: QueryLease,
-        query_budget: &Arc<QueryBudget>,
-    ) -> Result<Vec<QueryPlanningResult>> {
-        let jobs = tasks.len();
-        let (reply, replies) = bounded(jobs.max(1));
-        let mut submitted = 0_usize;
-        let mut first_error = None;
-        'submit: for (index, task) in tasks.into_iter().enumerate() {
-            let mut work = QueryWork::Planning {
-                lease: lease.clone(),
-                index,
-                task,
-                enqueued_at: Instant::now(),
-                query_budget: Arc::clone(query_budget),
-                reply: reply.clone(),
-            };
-            loop {
-                match self.sender.send_timeout(work, QUERY_WORK_WAIT) {
-                    Ok(()) => {
-                        submitted += 1;
-                        break;
-                    }
-                    Err(SendTimeoutError::Timeout(returned)) => {
-                        if let Err(error) =
-                            query_budget.check_waiting_for(OverloadReason::QueryQueue)
-                        {
-                            first_error = Some(error);
-                            break 'submit;
-                        }
-                        work = returned;
-                    }
-                    Err(SendTimeoutError::Disconnected(_)) => {
-                        return Err(Error::WorkerStopped);
-                    }
-                }
-            }
-        }
-        drop(reply);
-        if let Some(error) = first_error {
-            query_budget.cancel();
-            return Err(error);
-        }
-        let mut completed = Vec::with_capacity(submitted);
-        let mut received = 0_usize;
-        while received < submitted {
-            match replies.recv_timeout(QUERY_WORK_WAIT) {
-                Ok((index, result)) => {
-                    received += 1;
-                    match result {
-                        Ok(result) if first_error.is_none() => completed.push((index, result)),
-                        Ok(_) => {}
-                        Err(error) => {
-                            query_budget.cancel();
-                            return Err(error);
-                        }
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if first_error.is_none()
-                        && let Err(error) = query_budget.check()
-                    {
-                        query_budget.cancel();
-                        return Err(error);
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => return Err(Error::WorkerStopped),
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        completed.sort_unstable_by_key(|(index, _)| *index);
-        Ok(completed.into_iter().map(|(_, result)| result).collect())
     }
 
     pub(super) fn submit_series(
@@ -296,11 +106,6 @@ impl QueryExecutor {
 fn query_worker_loop(receiver: &Receiver<QueryWork>) {
     while let Ok(work) = receiver.recv() {
         match work {
-            #[cfg(test)]
-            QueryWork::Pause { entered, release } => {
-                let _ = entered.send(());
-                let _ = release.recv();
-            }
             QueryWork::Series {
                 lease,
                 index,
@@ -327,11 +132,7 @@ fn query_worker_loop(receiver: &Receiver<QueryWork>) {
                 // reservation before making that reply observable.
                 drop(cursor);
                 drop(lease);
-                query_budget.record_executor(
-                    ExecutorTaskKind::Series,
-                    queue_duration,
-                    active_started.elapsed(),
-                );
+                query_budget.record_executor(queue_duration, active_started.elapsed());
                 match result {
                     Ok(Err(error)) => {
                         query_budget
@@ -351,31 +152,6 @@ fn query_worker_loop(receiver: &Receiver<QueryWork>) {
                     }
                 }
             }
-            QueryWork::Planning {
-                lease,
-                index,
-                task,
-                enqueued_at,
-                query_budget,
-                reply,
-            } => {
-                let queue_duration = enqueued_at.elapsed();
-                let active_started = Instant::now();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    task.run(&query_budget)
-                }))
-                .unwrap_or(Err(Error::WorkerStopped));
-                drop(lease);
-                query_budget.record_executor(
-                    ExecutorTaskKind::Planning,
-                    queue_duration,
-                    active_started.elapsed(),
-                );
-                let _ = reply.send((index, result));
-            }
         }
     }
 }
-
-#[cfg(test)]
-mod tests;
